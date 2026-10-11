@@ -44,7 +44,11 @@ DEFAULTS: dict[str, Any] = {
     'firewall_enabled': True,
     # [{proto, wan_port, dest_ip, dest_port, enabled, note}, ...]
     'port_forwards': [],
+    # ARP neighbor table size (gc_thresh1). Options: 100,200,512,1024,2048
+    'arp_table_size': 100,
 }
+
+ARP_TABLE_CHOICES = (100, 200, 512, 1024, 2048)
 
 _IFACE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$')
 

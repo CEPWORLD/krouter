@@ -212,14 +212,27 @@ PY
   ) || true
 }
 
+apply_arp_from_settings() {
+  # Settings arp_table_size → /etc/sysctl.d/98-krouter-arp.conf + live sysctl
+  echo "[*] apply ARP table size from settings.db"
+  (cd "$ROOT" && "$PY" - <<'PY'
+import router_ctl
+ok, msg = router_ctl.apply_arp_table_size()
+print(f'ARP apply ok={ok}: {msg.strip()}')
+PY
+  ) || echo "[!] ARP apply skipped/failed" >&2
+}
+
 do_start() {
   echo "=== krouter-work START SAFE_MODE=${KROUTER_SAFE_MODE} ROOT=${ROOT} ==="
   if [[ "${KROUTER_SAFE_MODE}" == "0" ]]; then
     stop_old_systemd
     sync_firewall_conf
+    apply_arp_from_settings
     router_init
   else
     echo "[*] SAFE_MODE=1 — old systemd 유지, DHCP/DNS 패킷 서비스 idle"
+    apply_arp_from_settings
   fi
   local n
   for n in "${PROCS[@]}"; do

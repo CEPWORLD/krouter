@@ -11,6 +11,7 @@ SAFE_MODE: may bind UI only; DHCP sniff / DNS :53 / live iptables stay off.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -88,6 +89,69 @@ def _ctx(**extra):
     return base
 
 
+def _ip_sort_key(val):
+    try:
+        return (0, int(ipaddress.IPv4Address(str(val))))
+    except Exception:
+        return (1, str(val or '').lower())
+
+
+def _parse_sort(allowed: tuple[str, ...], default: str):
+    col = (request.args.get('sort') or default).strip()
+    if col not in allowed:
+        col = default
+    direction = (request.args.get('dir') or 'asc').strip().lower()
+    if direction not in ('asc', 'desc'):
+        direction = 'asc'
+    return col, direction
+
+
+def _sort_urls(endpoint: str, cols: tuple[str, ...], sort: str, direction: str, **extra):
+    """Build header links: first click asc, same column toggles."""
+    out = {}
+    marks = {}
+    for c in cols:
+        if c == sort:
+            nxt = 'desc' if direction == 'asc' else 'asc'
+            marks[c] = '▲' if direction == 'asc' else '▼'
+        else:
+            nxt = 'asc'
+            marks[c] = ''
+        out[c] = url_for(endpoint, sort=c, dir=nxt, **extra)
+    return out, marks
+
+
+def _sort_rows(rows: list, sort: str, direction: str, getters: dict):
+    g = getters.get(sort) or (lambda r: '')
+    rev = direction == 'desc'
+
+    def key(r):
+        v = g(r)
+        if isinstance(v, tuple):
+            return v
+        if isinstance(v, (int, float)):
+            return v
+        return str(v or '').lower()
+
+    try:
+        return sorted(rows, key=key, reverse=rev)
+    except TypeError:
+        return sorted(rows, key=lambda r: str(g(r) or '').lower(), reverse=rev)
+
+
+def _read_arp_live() -> str:
+    """Read live gc_thresh1/2/3 for Settings display."""
+    vals = []
+    for name in ('gc_thresh1', 'gc_thresh2', 'gc_thresh3'):
+        path = f'/proc/sys/net/ipv4/neigh/default/{name}'
+        try:
+            with open(path) as f:
+                vals.append(f.read().strip())
+        except Exception:
+            vals.append('?')
+    return '/'.join(vals)
+
+
 TPL_LOGIN = '''
 <!doctype html><title>krouter Login</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -161,7 +225,17 @@ TPL_DEVICES = MENU + '''
 </form>
 <h2>Reservations</h2>
 <table border="1" cellpadding="4" cellspacing="0">
-<tr><th>#</th><th>MAC</th><th>Host</th><th>IP</th><th>Mode</th><th>Effective</th><th>Allow until</th><th>Desc</th><th></th></tr>
+<tr>
+  <th>#</th>
+  <th><a href="{{ sort_urls.mac }}">MAC {{ sort_marks.mac }}</a></th>
+  <th><a href="{{ sort_urls.hostname }}">Host {{ sort_marks.hostname }}</a></th>
+  <th><a href="{{ sort_urls.ip }}">IP {{ sort_marks.ip }}</a></th>
+  <th><a href="{{ sort_urls.mode }}">Mode {{ sort_marks.mode }}</a></th>
+  <th><a href="{{ sort_urls.effective }}">Effective {{ sort_marks.effective }}</a></th>
+  <th><a href="{{ sort_urls.allow_until }}">Allow until {{ sort_marks.allow_until }}</a></th>
+  <th><a href="{{ sort_urls.desc }}">Desc {{ sort_marks.desc }}</a></th>
+  <th></th>
+</tr>
 {% for r in reservations %}
 <tr>
   <td>{{ loop.index }}</td>
@@ -215,7 +289,15 @@ TPL_EDIT = MENU + '''
 TPL_LEASES = MENU + '''
 <hr><h2>Leases</h2>
 <table border="1" cellpadding="4">
-<tr><th>MAC</th><th>IP</th><th>Host</th><th>Mode</th><th>Effective</th><th>Last seen</th></tr>
+<tr>
+  <th><a href="{{ sort_urls.mac }}">MAC {{ sort_marks.mac }}</a></th>
+  <th><a href="{{ sort_urls.ip }}">IP {{ sort_marks.ip }}</a></th>
+  <th><a href="{{ sort_urls.hostname }}">Host {{ sort_marks.hostname }}</a></th>
+  <th><a href="{{ sort_urls.mode }}">Mode {{ sort_marks.mode }}</a></th>
+  <th><a href="{{ sort_urls.effective }}">Effective {{ sort_marks.effective }}</a></th>
+  <th><a href="{{ sort_urls.last_seen }}">Last seen {{ sort_marks.last_seen }}</a></th>
+  <th></th>
+</tr>
 {% for l in leases %}
 <tr>
   <td>{{ l.mac }}</td><td>{{ l.ip }}</td><td>{{ l.hostname }}</td>
@@ -229,7 +311,13 @@ TPL_LEASES = MENU + '''
 TPL_HISTORY = MENU + '''
 <hr><h2>History</h2>
 <table border="1" cellpadding="4">
-<tr><th>MAC</th><th>IP</th><th>Host</th><th>Mode</th><th>Last seen</th></tr>
+<tr>
+  <th><a href="{{ sort_urls.mac }}">MAC {{ sort_marks.mac }}</a></th>
+  <th><a href="{{ sort_urls.ip }}">IP {{ sort_marks.ip }}</a></th>
+  <th><a href="{{ sort_urls.hostname }}">Host {{ sort_marks.hostname }}</a></th>
+  <th><a href="{{ sort_urls.mode }}">Mode {{ sort_marks.mode }}</a></th>
+  <th><a href="{{ sort_urls.last_seen }}">Last seen {{ sort_marks.last_seen }}</a></th>
+</tr>
 {% for h in histories %}
 <tr><td>{{ h.mac }}</td><td>{{ h.ip }}</td><td>{{ h.hostname }}</td>
 <td>{{ h.router }}</td><td>{{ h.last_seen }}</td></tr>
@@ -250,7 +338,11 @@ TPL_DNS = MENU + '''
   <button>Add mapping</button>
 </form>
 <table border="1" cellpadding="4">
-<tr><th>IP</th><th>Domain</th><th></th></tr>
+<tr>
+  <th><a href="{{ sort_urls.ip }}">IP {{ sort_marks.ip }}</a></th>
+  <th><a href="{{ sort_urls.domain }}">Domain {{ sort_marks.domain }}</a></th>
+  <th></th>
+</tr>
 {% for m in mappings %}
 <tr>
   <td>{{ m.ip }}</td><td>{{ m.domain }}</td>
@@ -269,7 +361,12 @@ TPL_BLOCKS = MENU + '''
   <button>Add</button>
 </form>
 <table border="1" cellpadding="4">
-<tr><th>Domain</th><th>On</th><th>Sub</th><th></th></tr>
+<tr>
+  <th><a href="{{ sort_urls.domain }}">Domain {{ sort_marks.domain }}</a></th>
+  <th><a href="{{ sort_urls.enabled }}">On {{ sort_marks.enabled }}</a></th>
+  <th><a href="{{ sort_urls.sub }}">Sub {{ sort_marks.sub }}</a></th>
+  <th></th>
+</tr>
 {% for d,r in rules %}
 <tr>
   <td>{{ d }}</td>
@@ -324,6 +421,21 @@ TPL_SETTINGS = MENU + '''
     (DNS/DHCP/NTP remain allowed. Saving refreshes the BLOCK chain.)
   </p>
   <textarea name="block_allow_rules" rows="6" cols="70" placeholder="tcp:1.2.3.4:443">{{ block_allow_text }}</textarea>
+  <h3>ARP table size (neighbor cache)</h3>
+  <p style="color:#555;font-size:13px;max-width:640px">
+    Limits how many ARP/neighbor entries the kernel keeps
+    (<code>gc_thresh1</code>; higher levels scale as ×4 / ×8).<br>
+    Larger values help networks with many devices or Wi‑Fi APs, but
+    <b>raising this too high can slow the server and increase load</b>.
+    Pick a level that matches your hardware and device count — start low and raise only if needed.
+  </p>
+  Size
+  <select name="arp_table_size">
+    {% for n in arp_choices %}
+    <option value="{{ n }}" {% if (s.arp_table_size|int) == n %}selected{% endif %}>{{ n }}{% if n == 100 %} (default){% endif %}</option>
+    {% endfor %}
+  </select>
+  <small>Current live: gc_thresh1/2/3 = {{ arp_live }}</small>
   <h3>Login account</h3>
   Username <input name="admin_user" value="{{ s.admin_user }}" required><br>
   New password <input name="new_password" type="password" placeholder="(blank = keep)"><br>
@@ -422,26 +534,63 @@ def about_page():
 @app.route('/')
 @web_auth.login_required
 def devices():
+    cols = ('mac', 'hostname', 'ip', 'mode', 'effective', 'allow_until', 'desc')
+    sort, direction = _parse_sort(cols, 'hostname')
     with dhc.MEMDB.lock:
         reservations = [dhc._enrich(r) for r in dhc.MEMDB.res_by_mac.values()]
-    reservations.sort(key=lambda r: (r.get('hostname') or r.get('mac') or ''))
-    return render_template_string(TPL_DEVICES, reservations=reservations, **_ctx())
+    reservations = _sort_rows(reservations, sort, direction, {
+        'mac': lambda r: r.get('mac') or '',
+        'hostname': lambda r: r.get('hostname') or '',
+        'ip': lambda r: _ip_sort_key(r.get('ip')),
+        'mode': lambda r: r.get('mode') or '',
+        'effective': lambda r: r.get('effective') or '',
+        'allow_until': lambda r: r.get('allow_until') or 0,
+        'desc': lambda r: r.get('desc') or '',
+    })
+    sort_urls, sort_marks = _sort_urls('devices', cols, sort, direction)
+    return render_template_string(
+        TPL_DEVICES, reservations=reservations,
+        sort_urls=sort_urls, sort_marks=sort_marks, **_ctx())
 
 
 @app.route('/leases')
 @web_auth.login_required
 def leases():
+    cols = ('mac', 'ip', 'hostname', 'mode', 'effective', 'last_seen')
+    sort, direction = _parse_sort(cols, 'ip')
     with dhc.MEMDB.lock:
         rows = [dhc._enrich(r) for r in dhc.MEMDB.leases_by_mac.values()]
-    return render_template_string(TPL_LEASES, leases=rows, **_ctx())
+    rows = _sort_rows(rows, sort, direction, {
+        'mac': lambda r: r.get('mac') or '',
+        'ip': lambda r: _ip_sort_key(r.get('ip')),
+        'hostname': lambda r: r.get('hostname') or '',
+        'mode': lambda r: r.get('mode') or '',
+        'effective': lambda r: r.get('effective') or '',
+        'last_seen': lambda r: r.get('last_seen') or 0,
+    })
+    sort_urls, sort_marks = _sort_urls('leases', cols, sort, direction)
+    return render_template_string(
+        TPL_LEASES, leases=rows, sort_urls=sort_urls, sort_marks=sort_marks, **_ctx())
 
 
 @app.route('/history')
 @web_auth.login_required
 def history():
+    cols = ('mac', 'ip', 'hostname', 'mode', 'last_seen')
+    sort, direction = _parse_sort(cols, 'last_seen')
     with dhc.MEMDB.lock:
         histories = list(dhc.MEMDB.history_by_mac.values())
-    return render_template_string(TPL_HISTORY, histories=histories, **_ctx())
+    histories = _sort_rows(histories, sort, direction, {
+        'mac': lambda r: r.get('mac') or '',
+        'ip': lambda r: _ip_sort_key(r.get('ip')),
+        'hostname': lambda r: r.get('hostname') or '',
+        'mode': lambda r: r.get('router') or '',
+        'last_seen': lambda r: r.get('last_seen') or 0,
+    })
+    sort_urls, sort_marks = _sort_urls('history', cols, sort, direction)
+    return render_template_string(
+        TPL_HISTORY, histories=histories,
+        sort_urls=sort_urls, sort_marks=sort_marks, **_ctx())
 
 
 @app.route('/add_reservation', methods=['POST'])
@@ -563,11 +712,19 @@ def delete_device(mac):
 @app.route('/dns')
 @web_auth.login_required
 def dns_page():
+    cols = ('ip', 'domain')
+    sort, direction = _parse_sort(cols, 'domain')
     dns.MEMDB.load_dns_from_disk()
     with dns.MEMDB.lock:
         mappings = list(dns.MEMDB.dns_mappings)
+    mappings = _sort_rows(mappings, sort, direction, {
+        'ip': lambda m: _ip_sort_key(m.get('ip')),
+        'domain': lambda m: m.get('domain') or '',
+    })
+    sort_urls, sort_marks = _sort_urls('dns_page', cols, sort, direction)
     return render_template_string(
-        TPL_DNS, mappings=mappings, bypass=dns.MEMDB.get_bypass(), **_ctx())
+        TPL_DNS, mappings=mappings, bypass=dns.MEMDB.get_bypass(),
+        sort_urls=sort_urls, sort_marks=sort_marks, **_ctx())
 
 
 @app.route('/dns/add', methods=['POST'])
@@ -596,10 +753,19 @@ def delete_mapping(ip, domain):
 @app.route('/blocks')
 @web_auth.login_required
 def blocks_page():
+    cols = ('domain', 'enabled', 'sub')
+    sort, direction = _parse_sort(cols, 'domain')
     dns.MEMDB.load_dns_from_disk()
     with dns.MEMDB.lock:
-        rules = sorted(dns.MEMDB.block_rules.items())
-    return render_template_string(TPL_BLOCKS, rules=rules, **_ctx())
+        rules = list(dns.MEMDB.block_rules.items())
+    rules = _sort_rows(rules, sort, direction, {
+        'domain': lambda t: t[0] or '',
+        'enabled': lambda t: (t[1] or {}).get('enabled', 0),
+        'sub': lambda t: (t[1] or {}).get('block_all_sub', 0),
+    })
+    sort_urls, sort_marks = _sort_urls('blocks_page', cols, sort, direction)
+    return render_template_string(
+        TPL_BLOCKS, rules=rules, sort_urls=sort_urls, sort_marks=sort_marks, **_ctx())
 
 
 @app.route('/blocks/add', methods=['POST'])
@@ -800,6 +966,12 @@ def settings_page():
                 raise ValueError('range outside subnet')
         except Exception:
             return "<script>alert('invalid DHCP auto IP range');history.back();</script>"
+        try:
+            arp_size = int(request.form.get('arp_table_size') or 100)
+        except (TypeError, ValueError):
+            arp_size = 100
+        if arp_size not in settings_store.ARP_TABLE_CHOICES:
+            return "<script>alert('invalid ARP table size');history.back();</script>"
         settings_store.set_many({
             'study_schedule_start': request.form.get('study_schedule_start', '00:00').strip(),
             'study_schedule_end': request.form.get('study_schedule_end', '00:00').strip(),
@@ -815,22 +987,28 @@ def settings_page():
             'default_block_domains': domains(request.form.get('default_block_domains', '')),
             'study_block_domains': domains(request.form.get('study_block_domains', '')),
             'block_allow_rules': allow_rules,
+            'arp_table_size': arp_size,
             'admin_user': new_user,
         })
         if npw:
             settings_store.set_value('admin_password_hash', web_auth.hash_password(npw))
         path = router_ctl.write_block_allow_conf(allow_rules)
         ok, msg = router_ctl.refresh_block()
+        arp_ok, arp_msg = router_ctl.apply_arp_table_size(arp_size)
         log.info(
             f"[SETTINGS] saved ifaces IN={internal} WAN={wan} auto={auto_s}-{auto_e} "
-            f"block_allow -> {path} refresh_ok={ok} {msg.strip()}")
+            f"arp={arp_size} ok={arp_ok} block_allow -> {path} refresh_ok={ok} {msg.strip()} "
+            f"arp_msg={arp_msg.strip()}")
         return redirect(url_for('settings_page'))
     s = settings_store.get_all()
+    arp_live = _read_arp_live()
     return render_template_string(
         TPL_SETTINGS, s=s,
         default_domains=', '.join(s.get('default_block_domains') or []),
         study_domains=', '.join(s.get('study_block_domains') or []),
         block_allow_text='\n'.join(s.get('block_allow_rules') or []),
+        arp_choices=settings_store.ARP_TABLE_CHOICES,
+        arp_live=arp_live,
         restart_msg=request.args.get('restart_msg'),
         **_ctx())
 
