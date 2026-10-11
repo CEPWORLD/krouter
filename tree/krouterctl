@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# krouterctl — start/stop/restart the whole work stack (admin + dhcp + dns + router.sh)
+#
+# Author : Kage
+# Project: krouter
+# Thought: one command should own the house stack so I am never stuck with two
+#          competing DHCP/DNS daemons after an upgrade.
+#
+# Usage: ./krouterctl start|stop|restart|status|ui|fallback
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+RUN_DIR="${ROOT}/run"
+LOG_DIR="${ROOT}/logs"
+DATA_DIR="${ROOT}/data"
+mkdir -p "$RUN_DIR" "$LOG_DIR" "$DATA_DIR"
+
+if [[ -x "${ROOT}/venv/bin/python" ]]; then
+  PY="${ROOT}/venv/bin/python"
+elif [[ -x /global/bin/krouter/venv/bin/python ]]; then
+  PY=/global/bin/krouter/venv/bin/python
+else
+  PY=python3
+fi
+
+# 기본: 라이브 스택 (DHCP+DNS+Admin). UI-only 는 SAFE=1
+export KROUTER_SAFE_MODE="${KROUTER_SAFE_MODE:-0}"
+export KROUTER_DRY_RUN="${KROUTER_DRY_RUN:-0}"
+export KROUTER_BIND="${KROUTER_BIND:-0.0.0.0}"
+export KROUTER_ADMIN_PORT="${KROUTER_ADMIN_PORT:-15000}"
+export PYTHONUNBUFFERED=1
+
+# 항상 세 프로세스 (SAFE=1 이어도 dhcp/dns 프로세스는 뜨지만 앱이 idle)
+PROCS=(admin dhcp dns)
+
+sudo_cmd() {
+  if [[ $EUID -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -E "$@"
+  else
+    echo "[!] root/sudo 필요: $*" >&2
+    return 1
+  fi
+}
+
+pidfile() { echo "${RUN_DIR}/${1}.pid"; }
+logfile() { echo "${LOG_DIR}/${1}.ctl.log"; }
+
+is_running() {
+  local name="$1" pf pid
+  pf="$(pidfile "$name")"
+  [[ -f "$pf" ]] || return 1
+  pid="$(cat "$pf" 2>/dev/null || true)"
+  [[ -n "${pid}" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+cmd_for() {
+  case "$1" in
+    admin) echo "$PY ${ROOT}/admin_app.py" ;;
+    dhcp)  echo "$PY ${ROOT}/dhcp_app.py" ;;
+    dns)   echo "$PY ${ROOT}/dns_app.py" ;;
+    *) return 1 ;;
+  esac
+}
+
+stop_old_systemd() {
+  echo "[*] stop old systemd dhcp/dns (avoid port clash)"
+  sudo_cmd systemctl stop dhcp.service 2>/dev/null || true
+  sudo_cmd systemctl stop dns.service 2>/dev/null || true
+  # 혹시 남은 구 프로세스
+  sudo_cmd pkill -f '/global/bin/krouter/dhcp_app.py' 2>/dev/null || true
+  sudo_cmd pkill -f '/global/bin/krouter/dns_app.py' 2>/dev/null || true
+  sleep 0.5
+}
+
+start_old_systemd() {
+  echo "[*] start old systemd dhcp/dns (fallback)"
+  sudo_cmd systemctl start dhcp.service 2>/dev/null || true
+  sudo_cmd systemctl start dns.service 2>/dev/null || true
+}
+
+load_settings_ifaces() {
+  # Settings.db → INB/OUT/SERVER_IP_DEFAULT/ROUTER_DNS_IP
+  local line kv
+  line="$(
+    cd "$ROOT" && "$PY" - <<'PY'
+import settings_store
+e = settings_store.router_env()
+for k in ("INB", "OUT", "SERVER_IP_DEFAULT", "ROUTER_DNS_IP"):
+    print(f'{k}={e[k]}')
+a, b = settings_store.dhcp_auto_range()
+print(f'DHCP_AUTO={a}-{b}')
+PY
+  )" || true
+  if [[ -z "$line" ]]; then
+    echo "[!] settings load failed — set Internal/WAN device in Admin Settings" >&2
+    return 1
+  fi
+  while IFS= read -r kv; do
+    [[ -z "$kv" ]] && continue
+    case "$kv" in
+      DHCP_AUTO=*) echo "[*] $kv" ;;
+      *=*) export "$kv" ;;
+    esac
+  done <<< "$line"
+  if [[ -z "${INB:-}" || -z "${OUT:-}" ]]; then
+    echo "[!] INB/OUT empty in settings.db — configure devices before start" >&2
+    return 1
+  fi
+  echo "[*] settings: INB=${INB} OUT=${OUT} GW=${SERVER_IP_DEFAULT} DNS=${ROUTER_DNS_IP}"
+}
+
+router_init() {
+  load_settings_ifaces
+  echo "[*] router.sh init (iptables chains) INB=${INB} OUT=${OUT}"
+  if [[ "${KROUTER_SAFE_MODE}" == "1" ]] || [[ "${KROUTER_DRY_RUN}" == "1" ]]; then
+    sudo_cmd env KROUTER_DRY_RUN=1 INB="${INB}" OUT="${OUT}" \
+      SERVER_IP_DEFAULT="${SERVER_IP_DEFAULT}" ROUTER_DNS_IP="${ROUTER_DNS_IP}" \
+      bash "${ROOT}/router.sh" init || true
+  else
+    sudo_cmd env KROUTER_DRY_RUN=0 INB="${INB}" OUT="${OUT}" \
+      SERVER_IP_DEFAULT="${SERVER_IP_DEFAULT}" ROUTER_DNS_IP="${ROUTER_DNS_IP}" \
+      bash "${ROOT}/router.sh" init
+  fi
+}
+
+start_one() {
+  local name="$1" pf lf cmd
+  pf="$(pidfile "$name")"
+  lf="$(logfile "$name")"
+  if is_running "$name"; then
+    echo "[*] $name already running pid=$(cat "$pf")"
+    return 0
+  fi
+  cmd="$(cmd_for "$name")"
+  echo "[*] starting $name (SAFE_MODE=${KROUTER_SAFE_MODE}): $cmd"
+  # dhcp/dns/admin 모두 동일 env, root로 (67/53 bind)
+  # shellcheck disable=SC2086
+  sudo_cmd env \
+    KROUTER_SAFE_MODE="${KROUTER_SAFE_MODE}" \
+    KROUTER_DRY_RUN="${KROUTER_DRY_RUN}" \
+    KROUTER_BIND="${KROUTER_BIND}" \
+    KROUTER_ADMIN_PORT="${KROUTER_ADMIN_PORT}" \
+    PYTHONUNBUFFERED=1 \
+    bash -c "cd '${ROOT}' && nohup ${cmd} >>'${lf}' 2>&1 & echo \$! >'${pf}'"
+  sleep 0.5
+  # pid 파일 소유 정리
+  sudo_cmd chown "$(id -u):$(id -g)" "$pf" 2>/dev/null || true
+  if is_running "$name"; then
+    echo "[+] $name started pid=$(cat "$pf")  log=$lf"
+  else
+    echo "[!] $name failed — see $lf" >&2
+    rm -f "$pf"
+    return 1
+  fi
+}
+
+app_py() {
+  case "$1" in
+    admin) echo "${ROOT}/admin_app.py" ;;
+    dhcp)  echo "${ROOT}/dhcp_app.py" ;;
+    dns)   echo "${ROOT}/dns_app.py" ;;
+  esac
+}
+
+stop_one() {
+  local name="$1" pf pid py
+  pf="$(pidfile "$name")"
+  py="$(app_py "$name")"
+  if ! is_running "$name"; then
+    sudo_cmd pkill -f "$py" 2>/dev/null || true
+    rm -f "$pf"
+    echo "[*] $name not running"
+    return 0
+  fi
+  pid="$(cat "$pf")"
+  echo "[*] stopping $name pid=$pid"
+  sudo_cmd kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 15); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    sudo_cmd kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pf"
+  echo "[+] $name stopped"
+}
+
+status_one() {
+  local name="$1"
+  if is_running "$name"; then
+    echo "  $name: RUNNING pid=$(cat "$(pidfile "$name")")"
+  else
+    echo "  $name: STOPPED"
+  fi
+}
+
+sync_firewall_conf() {
+  echo "[*] sync firewall/port-forward conf from settings.db"
+  (cd "$ROOT" && "$PY" - <<'PY'
+import router_ctl, settings_store
+settings_store.ensure_tables()
+s = settings_store.get_all()
+router_ctl.write_firewall_conf(bool(s.get('firewall_enabled')), s.get('port_forwards') or [])
+print('firewall_enabled=', bool(s.get('firewall_enabled')))
+PY
+  ) || true
+}
+
+do_start() {
+  echo "=== krouter-work START SAFE_MODE=${KROUTER_SAFE_MODE} ROOT=${ROOT} ==="
+  if [[ "${KROUTER_SAFE_MODE}" == "0" ]]; then
+    stop_old_systemd
+    sync_firewall_conf
+    router_init
+  else
+    echo "[*] SAFE_MODE=1 — old systemd 유지, DHCP/DNS 패킷 서비스 idle"
+  fi
+  local n
+  for n in "${PROCS[@]}"; do
+    start_one "$n" || true
+  done
+  echo
+  do_status
+  local host
+  host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  echo
+  echo "UI: http://${host:-192.168.0.1}:${KROUTER_ADMIN_PORT}/  (admin / admin)"
+  if [[ "${KROUTER_SAFE_MODE}" == "0" ]]; then
+    echo "LIVE: DHCP+DNS+iptables = work tree (old systemd stopped)"
+    echo "NTP: study 스케줄 밖 BLOCK 에서도 UDP/123 허용"
+  fi
+}
+
+do_stop() {
+  echo "=== krouter-work STOP ==="
+  local n
+  for n in dns dhcp admin; do
+    stop_one "$n" || true
+  done
+  # orphan admin from manual runs
+  sudo_cmd pkill -f "${ROOT}/admin_app.py" 2>/dev/null || true
+  sudo_cmd pkill -f "${ROOT}/dhcp_app.py" 2>/dev/null || true
+  sudo_cmd pkill -f "${ROOT}/dns_app.py" 2>/dev/null || true
+  echo "[+] work stack stopped (네트워크 DHCP/DNS 없음 — 필요시 ./krouterctl fallback)"
+}
+
+do_fallback() {
+  echo "=== fallback → old /global/bin/krouter systemd ==="
+  do_stop
+  start_old_systemd
+  sleep 1
+  systemctl is-active dhcp.service dns.service 2>/dev/null || true
+  echo "[+] old dhcp/dns requested"
+}
+
+do_restart() {
+  do_stop
+  sleep 0.5
+  do_start
+}
+
+do_status() {
+  echo "=== krouter-work STATUS SAFE_MODE=${KROUTER_SAFE_MODE} ==="
+  local n
+  for n in admin dhcp dns; do
+    status_one "$n"
+  done
+  echo "  old dhcp.service: $(systemctl is-active dhcp.service 2>/dev/null || echo unknown)"
+  echo "  old dns.service:  $(systemctl is-active dns.service 2>/dev/null || echo unknown)"
+  echo -n "  listen: "
+  ss -ulnp 2>/dev/null | grep -E ':(67|53) ' | awk '{print $5}' | tr '\n' ' ' || true
+  echo
+  local host
+  host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if is_running admin; then
+    echo "UI http://${host:-192.168.0.1}:${KROUTER_ADMIN_PORT}/"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") {start|stop|restart|status|ui|fallback}
+
+  start     구 systemd dhcp/dns 중지 → work router init → admin+dhcp+dns 시작
+  stop      work 스택만 중지
+  restart   stop + start
+  status    상태
+  ui        URL/계정
+  fallback  work 중지 후 예전 systemd dhcp/dns 복구
+
+기본: KROUTER_SAFE_MODE=0 (실제 DHCP/DNS/iptables)
+UI만:  KROUTER_SAFE_MODE=1 ./krouterctl start
+
+예:
+  sudo ./krouterctl start
+  ./krouterctl status
+  sudo ./krouterctl fallback    # 문제 시 예전 라우터로
+EOF
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  start)    do_start ;;
+  stop)     do_stop ;;
+  restart)  do_restart ;;
+  status)   do_status ;;
+  fallback) do_fallback ;;
+  ui)
+    host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "http://${host:-192.168.0.1}:${KROUTER_ADMIN_PORT}/"
+    echo "admin / admin"
+    ;;
+  -h|--help|help|"") usage; [[ -n "$cmd" ]] || exit 1 ;;
+  *) echo "unknown: $cmd" >&2; usage; exit 1 ;;
+esac

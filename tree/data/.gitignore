@@ -1,0 +1,10 @@
+# Local runtime state — do not publish host-specific config
+settings.db
+*.db
+*.db-shm
+*.db-wal
+firewall.conf
+port_forward.conf
+block_allow.conf
+dns_bypass
+update_dhcp_config

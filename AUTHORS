@@ -1,0 +1,12 @@
+krouter — Author
+
+  Kage
+
+History (short):
+  From about 2004 I kept expanding firewall and iptables-based routing work
+  (home labs and many other setups). A recognizable home-router shape grew
+  around 2006. Years of upgrades led to today's krouter.
+
+  Real household production use (not just experiments) started around
+  July 2025: krouter as the main gateway, the old router moved to AP mode,
+  and several AP-mode APs around the house — still in daily use.
