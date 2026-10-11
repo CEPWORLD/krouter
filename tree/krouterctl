@@ -213,8 +213,8 @@ PY
 }
 
 apply_arp_from_settings() {
-  # Settings arp_table_size → /etc/sysctl.d/98-krouter-arp.conf + live sysctl
-  echo "[*] apply ARP table size from settings.db"
+  # Settings arp_table_size preset → sysctl -w (no conf file)
+  echo "[*] apply ARP preset from settings.db (sysctl -w)"
   (cd "$ROOT" && "$PY" - <<'PY'
 import router_ctl
 ok, msg = router_ctl.apply_arp_table_size()

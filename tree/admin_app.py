@@ -423,16 +423,18 @@ TPL_SETTINGS = MENU + '''
   <textarea name="block_allow_rules" rows="6" cols="70" placeholder="tcp:1.2.3.4:443">{{ block_allow_text }}</textarea>
   <h3>ARP table size (neighbor cache)</h3>
   <p style="color:#555;font-size:13px;max-width:640px">
-    Limits how many ARP/neighbor entries the kernel keeps
-    (<code>gc_thresh1</code>; higher levels scale as ×4 / ×8).<br>
+    Preset for how many ARP/neighbor entries the kernel keeps
+    (<code>gc_thresh1</code>; thresh2/3 = ×4 / ×8). Also applies stale-time,
+    reachable-time, and solicit limits. Applied live via <code>sysctl -w</code>
+    on Save and stack start — no conf file is written.<br>
     Larger values help networks with many devices or Wi‑Fi APs, but
     <b>raising this too high can slow the server and increase load</b>.
-    Pick a level that matches your hardware and device count — start low and raise only if needed.
+    Match the level to your hardware and device count.
   </p>
   Size
   <select name="arp_table_size">
     {% for n in arp_choices %}
-    <option value="{{ n }}" {% if (s.arp_table_size|int) == n %}selected{% endif %}>{{ n }}{% if n == 100 %} (default){% endif %}</option>
+    <option value="{{ n }}" {% if (s.arp_table_size|int) == n %}selected{% endif %}>{{ n }}{% if n == 100 %} (default){% endif %} → {{ n }}/{{ n*4 }}/{{ n*8 }}</option>
     {% endfor %}
   </select>
   <small>Current live: gc_thresh1/2/3 = {{ arp_live }}</small>

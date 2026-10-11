@@ -44,11 +44,38 @@ DEFAULTS: dict[str, Any] = {
     'firewall_enabled': True,
     # [{proto, wan_port, dest_ip, dest_port, enabled, note}, ...]
     'port_forwards': [],
-    # ARP neighbor table size (gc_thresh1). Options: 100,200,512,1024,2048
+    # ARP neighbor table size preset key (= gc_thresh1). See ARP_PRESETS.
     'arp_table_size': 100,
 }
 
+# Preset key → live sysctl values (no conf file; applied via sysctl -w at start/save).
+# thresh ratio 1:4:8; stale/solicit knobs match typical multi-AP home tuning (no IPv6).
 ARP_TABLE_CHOICES = (100, 200, 512, 1024, 2048)
+ARP_PRESETS: dict[int, dict[str, int]] = {
+    n: {
+        'gc_thresh1': n,
+        'gc_thresh2': n * 4,
+        'gc_thresh3': n * 8,
+        'gc_stale_time': 300,
+        'base_reachable_time_ms': 300000,
+        'mcast_solicit': 6,
+        'ucast_solicit': 3,
+    }
+    for n in ARP_TABLE_CHOICES
+}
+
+
+def arp_preset(size: int | None = None) -> dict[str, int]:
+    """Resolve Settings arp_table_size → sysctl knobs."""
+    if size is None:
+        size = get('arp_table_size')
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        size = 100
+    if size not in ARP_PRESETS:
+        size = min(ARP_TABLE_CHOICES, key=lambda n: abs(n - size))
+    return dict(ARP_PRESETS[size])
 
 _IFACE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$')
 
