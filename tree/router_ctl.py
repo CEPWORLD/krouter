@@ -175,13 +175,21 @@ def apply_arp_table_size(size: int | None = None) -> tuple[bool, str]:
         log.info(note)
         return True, note
     try:
-        subprocess.run(['sudo', 'cp', staging, path], check=True, capture_output=True, text=True)
-        rt = subprocess.run(
-            ['sudo', 'sysctl', '-w',
-             f'net.ipv4.neigh.default.gc_thresh1={t1}',
-             f'net.ipv4.neigh.default.gc_thresh2={t2}',
-             f'net.ipv4.neigh.default.gc_thresh3={t3}'],
-            capture_output=True, text=True)
+        if os.geteuid() == 0:
+            with open(path, 'w') as f:
+                f.write(conf)
+            sysctl_cmd = ['sysctl', '-w',
+                          f'net.ipv4.neigh.default.gc_thresh1={t1}',
+                          f'net.ipv4.neigh.default.gc_thresh2={t2}',
+                          f'net.ipv4.neigh.default.gc_thresh3={t3}']
+        else:
+            subprocess.run(['sudo', 'cp', staging, path], check=True,
+                           capture_output=True, text=True)
+            sysctl_cmd = ['sudo', 'sysctl', '-w',
+                          f'net.ipv4.neigh.default.gc_thresh1={t1}',
+                          f'net.ipv4.neigh.default.gc_thresh2={t2}',
+                          f'net.ipv4.neigh.default.gc_thresh3={t3}']
+        rt = subprocess.run(sysctl_cmd, capture_output=True, text=True)
         out = (rt.stdout or '') + (rt.stderr or '')
         ok = rt.returncode == 0
         if ok:
