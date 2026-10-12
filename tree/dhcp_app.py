@@ -368,17 +368,30 @@ class MemDB:
                 db.commit()
 
     def get_reservation(self, mac):
+        mac = (mac or '').strip().lower()
         with self.lock:
             return self.res_by_mac.get(mac)
 
     def get_lease(self, mac):
+        mac = (mac or '').strip().lower()
         with self.lock:
             return self.leases_by_mac.get(mac)
 
     def device_row(self, mac):
         """reservation 우선, 없으면 lease. Always from MemDB."""
+        mac = (mac or '').strip().lower()
         with self.lock:
             return self.res_by_mac.get(mac) or self.leases_by_mac.get(mac)
+
+    def reservation_owner_of_ip(self, ip: str):
+        """Return MAC that has this IP reserved, or None."""
+        if not ip:
+            return None
+        with self.lock:
+            for m, r in self.res_by_mac.items():
+                if r.get('ip') == ip:
+                    return m
+        return None
 
     def set_allow_until(self, mac, until_ts):
         """Write-through allow_until on reservation (+ lease mirror)."""
@@ -426,9 +439,11 @@ MEMDB = MemDB(config.dhcp_db_file)
 
 
 def get_offer_info(mac, opts):
+    mac = (mac or '').strip().lower()
     MEMDB.maybe_pull_admin()
     reservation = MEMDB.get_reservation(mac)
     if reservation:
+        # Reservation always wins — even if MemDB lease still has an old IP (.152 etc).
         return (reservation.get('ip'),
                 reservation.get('hostname'),
                 reservation.get('router') or 'default',
@@ -437,18 +452,25 @@ def get_offer_info(mac, opts):
                 reservation.get('allow_until'))
     lease = MEMDB.get_lease(mac)
     if lease:
-        now = int(time.time())
-        if int(lease.get('last_seen', 0)) + int(lease.get('lease_time', 0)) >= now:
-            MEMDB.update_last_seen(mac)
+        lip = lease.get('ip')
+        owner = MEMDB.reservation_owner_of_ip(lip)
+        if owner and owner != mac:
+            # Stale lease on an IP reserved for someone else — drop and reassign.
+            app_log.info(f"[DHCP] drop lease {mac} {lip}: reserved for {owner}")
+            MEMDB.del_lease_by_mac(mac)
+        else:
+            now = int(time.time())
+            if int(lease.get('last_seen', 0)) + int(lease.get('lease_time', 0)) >= now:
+                MEMDB.update_last_seen(mac)
+                return (lease.get('ip'), lease.get('hostname'),
+                        lease.get('router') or 'default',
+                        lease.get('lease_time') or config.DEFAULT_LEASE,
+                        'LEA', lease.get('allow_until'))
+            MEMDB.del_lease_by_mac(mac)
             return (lease.get('ip'), lease.get('hostname'),
                     lease.get('router') or 'default',
                     lease.get('lease_time') or config.DEFAULT_LEASE,
-                    'LEA', lease.get('allow_until'))
-        MEMDB.del_lease_by_mac(mac)
-        return (lease.get('ip'), lease.get('hostname'),
-                lease.get('router') or 'default',
-                lease.get('lease_time') or config.DEFAULT_LEASE,
-                'NEW', None)
+                    'NEW', None)
     assigned = MEMDB.get_all_assigned_ips()
     ip = common.find_free_ip(assigned, log=app_log)
     if not ip:
@@ -467,7 +489,7 @@ def handle_dhcp(pkt):
         dhcp = pkt[DHCP]
         if not dhcp.options:
             return
-        mac = pkt[Ether].src
+        mac = (pkt[Ether].src or '').lower()
         xid = bootp.xid
         opts = {}
         for opt in dhcp.options:
@@ -487,9 +509,9 @@ def handle_dhcp(pkt):
             if not offered_ip:
                 sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
                 return
-            if info == 'NEW':
-                MEMDB.save_lease(mac, offered_ip, hostname, lease_time, router_field, allow_until)
-                apply_mac_policy(mac, router_field, allow_until)
+            # Keep lease row in sync for RES/LEA/NEW (policy + Admin UI)
+            MEMDB.save_lease(mac, offered_ip, hostname, lease_time, router_field, allow_until)
+            apply_mac_policy(mac, router_field, allow_until)
             offer = common.make_dhcp_offer(
                 offered_ip, xid, pkt[BOOTP].chaddr, dns,
                 policy.pick_offer_gateway(router_field, gw), lease_time, hostname=hostname)
@@ -498,30 +520,35 @@ def handle_dhcp(pkt):
 
         elif msg_type == 3:
             req_ip = opts.get('requested_addr')
+            if isinstance(req_ip, bytes):
+                try:
+                    req_ip = '.'.join(str(b) for b in req_ip)
+                except Exception:
+                    req_ip = None
             offered_ip, hostname, router_field, lease_time, info, allow_until = get_offer_info(mac, opts)
-            if req_ip:
-                # 수동 예약은 서브넷 전영역 허용 (auto range 밖 포함)
-                if not common.ip_in_network(req_ip) or offered_ip != req_ip:
-                    sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
-                    return
-                MEMDB.save_lease(mac, req_ip, hostname, lease_time, router_field, allow_until)
-                apply_mac_policy(mac, router_field, allow_until)
-                ack = common.make_dhcp_ack(
-                    req_ip, xid, pkt[BOOTP].chaddr, dns,
-                    policy.pick_offer_gateway(router_field, gw), lease_time, hostname=hostname)
-                sendp(ack, iface=iface, verbose=False)
-            else:
-                if not offered_ip:
-                    return
-                MEMDB.save_lease(mac, offered_ip, hostname, lease_time, router_field, allow_until)
-                apply_mac_policy(mac, router_field, allow_until)
-                ack = common.make_dhcp_ack(
-                    offered_ip, xid, pkt[BOOTP].chaddr, dns,
-                    policy.pick_offer_gateway(router_field, gw), lease_time, hostname=hostname)
-                sendp(ack, iface=iface, verbose=False)
+            if not offered_ip:
+                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
+                app_log.info(f"[DHCPNAK] {mac} no offer available")
+                return
+            # Client asking for wrong IP (e.g. old .152 while reserved .145) → NAK so it rediscovers.
+            if req_ip and str(req_ip) != str(offered_ip):
+                app_log.info(
+                    f"[DHCPNAK] {mac} requested {req_ip} but must use {offered_ip} ({info})")
+                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
+                return
+            if req_ip and not common.ip_in_network(req_ip):
+                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
+                return
+            ack_ip = str(offered_ip)
+            MEMDB.save_lease(mac, ack_ip, hostname, lease_time, router_field, allow_until)
+            apply_mac_policy(mac, router_field, allow_until)
+            ack = common.make_dhcp_ack(
+                ack_ip, xid, pkt[BOOTP].chaddr, dns,
+                policy.pick_offer_gateway(router_field, gw), lease_time, hostname=hostname)
+            sendp(ack, iface=iface, verbose=False)
+            app_log.info(f"[DHCPACK] {mac} {ack_ip} mode={router_field} ({info})")
     except Exception as e:
-        app_log.error(f"[ERROR] DHCP handler: {e}")
-
+        app_log.error(f"[ERROR] DHCP handler: {e}", exc_info=True)
 
 def periodic_cleanup():
     while True:
