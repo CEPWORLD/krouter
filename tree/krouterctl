@@ -52,10 +52,13 @@ logfile() { echo "${LOG_DIR}/${1}.ctl.log"; }
 is_running() {
   local name="$1" pf pid
   pf="$(pidfile "$name")"
-  [[ -f "$pf" ]] || return 1
-  pid="$(cat "$pf" 2>/dev/null || true)"
-  [[ -n "${pid}" ]] || return 1
-  kill -0 "$pid" 2>/dev/null
+  # Prefer live process match — pidfile sometimes stores the wrapper bash pid.
+  pid="$(pgrep -f "${ROOT}/${name}_app.py" | head -1 || true)"
+  if [[ -n "$pid" ]]; then
+    echo "$pid" >"$pf" 2>/dev/null || true
+    return 0
+  fi
+  return 1
 }
 
 cmd_for() {
@@ -201,11 +204,20 @@ stop_one() {
 
 status_one() {
   local name="$1"
+  local pf pid
+  pf="$(pidfile "$name")"
+  # pidfile may lag; also detect by process command line
   if is_running "$name"; then
-    echo "  $name: RUNNING pid=$(cat "$(pidfile "$name")")"
-  else
-    echo "  $name: STOPPED"
+    echo "  $name: RUNNING pid=$(cat "$pf")"
+    return 0
   fi
+  pid="$(pgrep -f "${ROOT}/${name}_app.py" | head -1 || true)"
+  if [[ -n "$pid" ]]; then
+    echo "  $name: RUNNING pid=$pid (pidfile stale)"
+    echo "$pid" >"$pf" 2>/dev/null || true
+    return 0
+  fi
+  echo "  $name: STOPPED"
 }
 
 sync_firewall_conf() {

@@ -43,6 +43,10 @@ app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
 log = logging.getLogger('admin_app')
 log.setLevel(logging.INFO)
+# router_ctl apply success is INFO — ensure it reaches admin.ctl.log (nohup stderr)
+logging.getLogger('router_ctl').setLevel(logging.INFO)
+if not logging.getLogger('router_ctl').handlers:
+    logging.getLogger('router_ctl').addHandler(logging.StreamHandler())
 if not log.handlers:
     _ah = RotatingFileHandler(
         os.path.join(config.KROUTER_ROOT, 'logs', 'admin.log'),

@@ -131,7 +131,46 @@ class MemDB:
             for r in db.execute('SELECT * FROM history'):
                 self.history_by_mac[r['mac']] = dict(r)
             self.routers = [dict(r) for r in db.execute('SELECT * FROM routers ORDER BY ip')]
+        self._policy_mtime = self._trigger_mtime()
         app_log.info(f"[MEMDB] Loaded leases={len(self.leases_by_mac)} res={len(self.res_by_mac)}")
+
+    def _trigger_mtime(self) -> float:
+        try:
+            return os.path.getmtime(config.trigger)
+        except Exception:
+            return 0.0
+
+    def pull_admin_writes(self) -> bool:
+        """
+        Admin (UI) and DHCP are separate processes with separate MemDB copies.
+        Admin owns reservations (mode / allow_until / static IP). DHCP must pull
+        those rows from sqlite before flush or iptables apply — otherwise the
+        30s periodic_flush and DHCP renew overwrite grants with stale memory.
+        """
+        changed = False
+        with self.lock, sqlite3.connect(self.db_path) as db:
+            db.row_factory = sqlite3.Row
+            disk_res = {r['mac']: dict(r) for r in db.execute('SELECT * FROM reservations')}
+            if disk_res != self.res_by_mac:
+                changed = True
+            self.res_by_mac = disk_res
+            for mac, d in disk_res.items():
+                if mac not in self.leases_by_mac:
+                    continue
+                lr = self.leases_by_mac[mac]
+                for k in ('router', 'allow_until', 'ip', 'hostname', 'lease_time'):
+                    if k in d and lr.get(k) != d.get(k):
+                        lr[k] = d.get(k)
+                        changed = True
+        self._policy_mtime = self._trigger_mtime()
+        if changed:
+            app_log.info(f"[MEMDB] pulled admin reservations res={len(self.res_by_mac)}")
+        return changed
+
+    def maybe_pull_admin(self, force: bool = False) -> bool:
+        if force or self._trigger_mtime() != getattr(self, '_policy_mtime', None):
+            return self.pull_admin_writes()
+        return False
 
     def flush_all(self):
         with self.lock, sqlite3.connect(self.db_path) as db:
@@ -161,15 +200,18 @@ class MemDB:
                 db.execute('INSERT OR REPLACE INTO routers (ip, desc) VALUES (?, ?)',
                            (r['ip'], r.get('desc')))
             db.commit()
-        # DNS 캐시 갱신 트리거
+        # DNS + peer-process policy reload trigger
         try:
             open(config.trigger, 'a').close()
         except Exception:
             pass
+        self._policy_mtime = self._trigger_mtime()
 
     def periodic_flush(self, interval=30):
         while True:
             try:
+                # Pull Admin grants/mode changes before writing, or we clobber them.
+                self.pull_admin_writes()
                 self.flush_all()
             except Exception as e:
                 app_log.error(f"[MEMDB] flush error: {e}")
@@ -276,6 +318,7 @@ MEMDB = MemDB(config.dhcp_db_file)
 
 
 def get_offer_info(mac, opts):
+    MEMDB.maybe_pull_admin()
     reservation = MEMDB.get_reservation(mac)
     if reservation:
         return (reservation.get('ip'),
@@ -390,9 +433,11 @@ def periodic_cleanup():
 
 
 def allow_expiry_watcher():
-    """study 임시해금 만료 → 체인 재적용."""
+    """Admin grant/mode pull + study 임시해금 만료 + 체인 재적용."""
+    prev_fp: dict[str, tuple] = {}
     while True:
         try:
+            pulled = MEMDB.pull_admin_writes()
             expired = MEMDB.clear_expired_allows()
             for mac in expired:
                 row = MEMDB.device_row(mac)
@@ -401,16 +446,21 @@ def allow_expiry_watcher():
                 mode = policy.normalize_mode(row.get('router'))
                 eff, ok, msg = apply_mac_policy(mac, mode, row.get('allow_until'))
                 app_log.info(f"[ALLOW-EXPIRE] {mac} -> {eff} ok={ok} {msg}")
-            # study 스케줄 변경에 따른 BLOCK↔STUDY 도 주기 재적용
             with MEMDB.lock:
-                macs = list(MEMDB.res_by_mac.keys()) + list(MEMDB.leases_by_mac.keys())
-            for mac in dict.fromkeys(macs):
-                row = MEMDB.device_row(mac)
-                if not row:
-                    continue
-                if policy.normalize_mode(row.get('router')) != 'study':
-                    continue
-                apply_mac_policy(mac, 'study', row.get('allow_until'))
+                items = list(MEMDB.res_by_mac.items())
+                for mac, r in MEMDB.leases_by_mac.items():
+                    if mac not in MEMDB.res_by_mac:
+                        items.append((mac, r))
+            for mac, r in items:
+                mode = policy.normalize_mode(r.get('router'))
+                au = r.get('allow_until')
+                fp = (mode, au)
+                # Re-apply when Admin changed mode/allow, on expire, or study schedule tick
+                if pulled or mac in expired or prev_fp.get(mac) != fp or mode == 'study':
+                    eff, ok, msg = apply_mac_policy(mac, r.get('router') or 'default', au)
+                    if prev_fp.get(mac) != fp or mac in expired:
+                        app_log.info(f"[POLICY] {mac} mode={mode} -> {eff} ok={ok}")
+                    prev_fp[mac] = fp
         except Exception as e:
             app_log.error(f"[ALLOW-WATCH] {e}")
         time.sleep(30)
