@@ -144,27 +144,59 @@ class MemDB:
         with self.lock, sqlite3.connect(config.dhcp_db_file) as db:
             db.row_factory = sqlite3.Row
             self.reservations_by_ip = {}
+            self.reservations_by_mac = {}
             cols = [r[1] for r in db.execute('PRAGMA table_info(reservations)')]
             extra = ', allow_until' if 'allow_until' in cols else ''
             for r in db.execute(
                     f'SELECT mac,ip,hostname,lease_time,router,desc{extra} FROM reservations'):
+                d = dict(r)
                 if r['ip']:
-                    self.reservations_by_ip[r['ip']] = dict(r)
+                    self.reservations_by_ip[r['ip']] = d
+                if r['mac']:
+                    self.reservations_by_mac[str(r['mac']).lower()] = d
             self.leases_by_ip = {}
+            self.leases_by_mac = {}
             cols = [r[1] for r in db.execute('PRAGMA table_info(leases)')]
             extra = ', allow_until' if 'allow_until' in cols else ''
             for r in db.execute(
                     f'SELECT mac,ip,hostname,lease_start,lease_time,last_seen,router{extra} FROM leases'):
+                d = dict(r)
                 if r['ip']:
-                    self.leases_by_ip[r['ip']] = dict(r)
+                    self.leases_by_ip[r['ip']] = d
+                if r['mac']:
+                    self.leases_by_mac[str(r['mac']).lower()] = d
         self._trigger_mtime = trig_mtime
         self.last_refresh_dhcp = now
 
+    @staticmethod
+    def _arp_mac(ip: str):
+        """Resolve client IP → MAC via kernel neigh table."""
+        try:
+            with open('/proc/net/arp') as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == ip:
+                        mac = parts[3].lower()
+                        if mac != '00:00:00:00:00:00':
+                            return mac
+        except Exception:
+            pass
+        return None
+
     def client_row(self, client_ip: str):
-        """Fresh sqlite row for client IP (reservation preferred)."""
+        """Reservation/lease for client — by IP, else ARP→MAC (APIPA / IP churn)."""
         self.refresh_dhcp_cache()
         with self.lock:
-            return self.reservations_by_ip.get(client_ip) or self.leases_by_ip.get(client_ip)
+            row = self.reservations_by_ip.get(client_ip) or self.leases_by_ip.get(client_ip)
+            if row:
+                return row
+            by_mac_r = self.reservations_by_mac
+            by_mac_l = self.leases_by_mac
+        mac = self._arp_mac(client_ip)
+        if not mac:
+            return None
+        return by_mac_r.get(mac) or by_mac_l.get(mac)
 
     def client_effective(self, client_ip: str) -> str:
         row = self.client_row(client_ip)

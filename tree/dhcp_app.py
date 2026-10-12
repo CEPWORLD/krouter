@@ -367,6 +367,14 @@ class MemDB:
                 db.execute('DELETE FROM routers WHERE ip=?', (ip,))
                 db.commit()
 
+    def get_reservation(self, mac):
+        with self.lock:
+            return self.res_by_mac.get(mac)
+
+    def get_lease(self, mac):
+        with self.lock:
+            return self.leases_by_mac.get(mac)
+
     def device_row(self, mac):
         """reservation 우선, 없으면 lease. Always from MemDB."""
         with self.lock:
