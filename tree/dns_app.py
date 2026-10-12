@@ -134,7 +134,10 @@ class MemDB:
             trig_mtime = os.path.getmtime(config.trigger) if os.path.exists(config.trigger) else 0
         except Exception:
             trig_mtime = 0
-        if not force and now - self.last_refresh_dhcp < 5 and trig_mtime == self._trigger_mtime:
+        # Reload when trigger moves, or at least every 2s (allow_until grants must be fast).
+        if (not force
+                and now - self.last_refresh_dhcp < 2
+                and trig_mtime == self._trigger_mtime):
             return
         if not os.path.exists(config.dhcp_db_file):
             return
@@ -157,15 +160,19 @@ class MemDB:
         self._trigger_mtime = trig_mtime
         self.last_refresh_dhcp = now
 
-    def client_effective(self, client_ip: str) -> str:
+    def client_row(self, client_ip: str):
+        """Fresh sqlite row for client IP (reservation preferred)."""
+        self.refresh_dhcp_cache()
         with self.lock:
-            row = self.reservations_by_ip.get(client_ip) or self.leases_by_ip.get(client_ip)
+            return self.reservations_by_ip.get(client_ip) or self.leases_by_ip.get(client_ip)
+
+    def client_effective(self, client_ip: str) -> str:
+        row = self.client_row(client_ip)
         kw = settings_store.policy_kwargs()
         if not row:
             return policy.effective_mode('default', None, **kw)
         return policy.effective_mode(
             policy.normalize_mode(row.get('router')), row.get('allow_until'), **kw)
-
     @staticmethod
     def normalize(name: str) -> str:
         return (name or '').rstrip('.').lower()
@@ -205,8 +212,7 @@ class MemDB:
 
     def client_label(self, client_ip: str) -> str:
         """로그용: IP + hostname/mac (있으면)."""
-        with self.lock:
-            row = self.reservations_by_ip.get(client_ip) or self.leases_by_ip.get(client_ip)
+        row = self.client_row(client_ip)
         if not row:
             return client_ip
         host = (row.get('hostname') or '').strip() or '-'
@@ -245,7 +251,10 @@ class DNSServer:
 
     def _reply_a(self, req, ip_str):
         reply = req.reply()
-        reply.add_answer(RR(rname=req.q.qname, rtype=QTYPE.A, rclass=1, ttl=300, rdata=A(ip_str)))
+        # Short TTL on FAKE blocks so a later allow_until grant is picked up quickly
+        # (phones otherwise cache 0.0.0.0 for youtube for many minutes).
+        ttl = 30 if ip_str == getattr(config, 'fake_ip', '0.0.0.0') else 300
+        reply.add_answer(RR(rname=req.q.qname, rtype=QTYPE.A, rclass=1, ttl=ttl, rdata=A(ip_str)))
         reply.header.rcode = RCODE.NOERROR
         return reply
 

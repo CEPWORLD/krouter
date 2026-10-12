@@ -139,10 +139,18 @@ class MemDB:
 
     def _touch_trigger(self):
         """Notify peer processes (DHCP/DNS) that sqlite policy data changed."""
+        path = config.trigger
         try:
-            open(config.trigger, 'a').close()
-        except Exception:
-            pass
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            with open(path, 'a'):
+                pass
+            os.utime(path, None)
+            try:
+                os.chmod(path, 0o666)
+            except Exception:
+                pass
+        except Exception as e:
+            app_log.warning(f"[MEMDB] trigger touch failed {path}: {e}")
         self._policy_mtime = self._trigger_mtime()
 
     def _db(self):
@@ -525,37 +533,35 @@ def periodic_cleanup():
 
 
 def allow_expiry_watcher():
-    """Admin grant/mode pull + study 임시해금 만료 + 체인 재적용."""
-    prev_fp: dict[str, tuple] = {}
+    """
+    Sync Admin writes, expire allows, re-apply iptables only when effective chain changes.
+    Do NOT re-apply every study device every 30s — that raced and stomped ALL_ALLOW grants.
+    """
+    prev_eff: dict[str, str] = {}
     while True:
         try:
-            pulled = MEMDB.pull_admin_writes()
+            MEMDB.sync_reservations_from_disk()
             expired = MEMDB.clear_expired_allows()
-            for mac in expired:
-                row = MEMDB.device_row(mac)
-                if not row:
-                    continue
-                mode = policy.normalize_mode(row.get('router'))
-                eff, ok, msg = apply_mac_policy(mac, mode, row.get('allow_until'))
-                app_log.info(f"[ALLOW-EXPIRE] {mac} -> {eff} ok={ok} {msg}")
+            kw = settings_store.policy_kwargs()
             with MEMDB.lock:
                 items = list(MEMDB.res_by_mac.items())
                 for mac, r in MEMDB.leases_by_mac.items():
                     if mac not in MEMDB.res_by_mac:
                         items.append((mac, r))
             for mac, r in items:
-                mode = policy.normalize_mode(r.get('router'))
+                mode = r.get('router') or 'default'
                 au = r.get('allow_until')
-                fp = (mode, au)
-                # Re-apply when Admin changed mode/allow, on expire, or study schedule tick
-                if pulled or mac in expired or prev_fp.get(mac) != fp or mode == 'study':
-                    eff, ok, msg = apply_mac_policy(mac, r.get('router') or 'default', au)
-                    if prev_fp.get(mac) != fp or mac in expired:
-                        app_log.info(f"[POLICY] {mac} mode={mode} -> {eff} ok={ok}")
-                    prev_fp[mac] = fp
+                eff = policy.effective_mode(mode, au, **kw)
+                if prev_eff.get(mac) == eff and mac not in expired:
+                    continue
+                got, ok, msg = apply_mac_policy(mac, mode, au)
+                app_log.info(
+                    f"[POLICY] {mac} mode={policy.normalize_mode(mode)} -> {got} "
+                    f"ok={ok}{' (expire)' if mac in expired else ''}")
+                prev_eff[mac] = got
         except Exception as e:
             app_log.error(f"[ALLOW-WATCH] {e}")
-        time.sleep(30)
+        time.sleep(15)
 
 
 def run_dhcp():
