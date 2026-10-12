@@ -91,16 +91,30 @@ def in_study_schedule(now: Optional[datetime] = None,
     return t >= s or t < e
 
 
+def _ts_active(ts: Optional[int], now_ts: int) -> bool:
+    if ts is None:
+        return False
+    try:
+        return int(ts) > now_ts
+    except (TypeError, ValueError):
+        return False
+
+
 def effective_mode(mode: str,
                    allow_until: Optional[int] = None,
                    now_ts: Optional[int] = None,
                    study_start: str = '06:00',
                    study_end: str = '22:00',
-                   gateway: str = '192.168.0.1') -> str:
+                   gateway: str = '192.168.0.1',
+                   study_until: Optional[int] = None) -> str:
     """
     반환: ALL_ALLOW | DEFAULT | STUDY | BLOCK
-    study 기본은 study. allow_until 유효 시에만 잠시 ALL_ALLOW → 만료 후 다시 study.
-    custom GW(임의 IP)는 예전처럼 iptables 무제한(차단은 가상 GW) → ALL_ALLOW.
+
+    study 장비:
+      allow_until 유효 → ALL_ALLOW (Free time)
+      정규 스케줄 안이거나 study_until 유효 → STUDY (Extend study: 차단 유지, BLOCK만 해제)
+      그 외 → BLOCK
+    custom GW → ALL_ALLOW.
     """
     kind = normalize_mode(mode, gateway)
     now_ts = int(now_ts if now_ts is not None else datetime.now().timestamp())
@@ -109,18 +123,17 @@ def effective_mode(mode: str,
         return 'ALL_ALLOW'
     if kind == 'default':
         return 'DEFAULT'
-    # study — 장비 모드는 계속 study. 임시해금만 오버라이드.
-    if allow_until is not None:
-        try:
-            au = int(allow_until)
-        except (TypeError, ValueError):
-            au = 0
-        if au > now_ts:
-            return 'ALL_ALLOW'
+    # Free time first (full unblock)
+    if _ts_active(allow_until, now_ts):
+        return 'ALL_ALLOW'
     now_dt = datetime.fromtimestamp(now_ts)
-    if in_study_schedule(now_dt, study_start, study_end):
+    if in_study_schedule(now_dt, study_start, study_end) or _ts_active(study_until, now_ts):
         return 'STUDY'
     return 'BLOCK'
+
+
+# alias — same duration helper for Free time / Extend study buttons
+compute_study_until = compute_allow_until
 
 
 def dns_policy_for_effective(effective: str) -> str:

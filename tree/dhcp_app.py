@@ -67,11 +67,17 @@ def _sched():
     return settings_store.policy_kwargs()
 
 
-def apply_mac_policy(mac: str, mode: str, allow_until=None):
+def apply_mac_policy(mac: str, mode: str, allow_until=None, study_until=None):
     kw = _sched()
-    return router_ctl.apply_effective(mac, mode, allow_until,
-                                      study_start=kw['study_start'],
-                                      study_end=kw['study_end'])
+    row = MEMDB.get_reservation(mac) or MEMDB.get_lease(mac) or {}
+    if allow_until is None:
+        allow_until = row.get('allow_until')
+    if study_until is None:
+        study_until = row.get('study_until')
+    return router_ctl.apply_effective(
+        mac, mode, allow_until,
+        study_start=kw['study_start'], study_end=kw['study_end'],
+        study_until=study_until)
 
 
 class MemDB:
@@ -110,11 +116,13 @@ class MemDB:
               CREATE TABLE IF NOT EXISTS routers (
                   ip TEXT PRIMARY KEY, desc TEXT
               )''')
-            # 마이그레이션: allow_until 컬럼
+            # 마이그레이션: allow_until / study_until
             for table in ('leases', 'reservations'):
                 cols = [r[1] for r in c.execute(f'PRAGMA table_info({table})')]
                 if 'allow_until' not in cols:
                     c.execute(f'ALTER TABLE {table} ADD COLUMN allow_until INTEGER')
+                if 'study_until' not in cols:
+                    c.execute(f'ALTER TABLE {table} ADD COLUMN study_until INTEGER')
             db.commit()
             row = c.execute('SELECT ip FROM routers WHERE ip=?', (config.GATEWAY,)).fetchone()
             if not row:
@@ -174,7 +182,7 @@ class MemDB:
                 lr = self.leases_by_mac.get(mac)
                 if not lr:
                     continue
-                for k in ('router', 'allow_until', 'ip', 'hostname', 'lease_time'):
+                for k in ('router', 'allow_until', 'study_until', 'ip', 'hostname', 'lease_time'):
                     if lr.get(k) != d.get(k):
                         lr[k] = d.get(k)
                         changed = True
@@ -212,6 +220,7 @@ class MemDB:
             'router': row.get('router') or 'default',
             'desc': row.get('desc') or '',
             'allow_until': row.get('allow_until'),
+            'study_until': row.get('study_until'),
         }
         with self.lock:
             self.res_by_mac[mac] = data
@@ -219,6 +228,7 @@ class MemDB:
                 lr = self.leases_by_mac[mac]
                 lr['router'] = data['router']
                 lr['allow_until'] = data['allow_until']
+                lr['study_until'] = data['study_until']
                 if data.get('ip'):
                     lr['ip'] = data['ip']
                 if data.get('hostname'):
@@ -228,15 +238,17 @@ class MemDB:
             with self._db() as db:
                 db.execute(
                     'INSERT OR REPLACE INTO reservations '
-                    '(mac,ip,hostname,lease_time,router,desc,allow_until) VALUES (?,?,?,?,?,?,?)',
+                    '(mac,ip,hostname,lease_time,router,desc,allow_until,study_until) '
+                    'VALUES (?,?,?,?,?,?,?,?)',
                     (mac, data['ip'], data['hostname'], data['lease_time'],
-                     data['router'], data['desc'], data['allow_until']))
+                     data['router'], data['desc'], data['allow_until'], data['study_until']))
                 if mac in self.leases_by_mac:
                     db.execute(
-                        'UPDATE leases SET ip=?, hostname=?, lease_time=?, router=?, allow_until=? WHERE mac=?',
+                        'UPDATE leases SET ip=?, hostname=?, lease_time=?, router=?, '
+                        'allow_until=?, study_until=? WHERE mac=?',
                         (self.leases_by_mac[mac].get('ip'), self.leases_by_mac[mac].get('hostname'),
                          self.leases_by_mac[mac].get('lease_time'), data['router'],
-                         data['allow_until'], mac))
+                         data['allow_until'], data['study_until'], mac))
                 db.commit()
         self._touch_trigger()
         return data
@@ -260,6 +272,7 @@ class MemDB:
             if res:
                 data['router'] = res.get('router') or data.get('router') or 'default'
                 data['allow_until'] = res.get('allow_until')
+                data['study_until'] = res.get('study_until')
                 if res.get('ip'):
                     data['ip'] = res.get('ip')
                 if res.get('hostname'):
@@ -270,15 +283,16 @@ class MemDB:
             with self._db() as db:
                 db.execute(
                     'INSERT OR REPLACE INTO leases '
-                    '(mac,ip,hostname,lease_start,lease_time,last_seen,router,allow_until) '
-                    'VALUES (?,?,?,?,?,?,?,?)',
+                    '(mac,ip,hostname,lease_start,lease_time,last_seen,router,'
+                    'allow_until,study_until) VALUES (?,?,?,?,?,?,?,?,?)',
                     (mac, data.get('ip'), data.get('hostname'), data.get('lease_start'),
                      data.get('lease_time'), data.get('last_seen'), data.get('router'),
-                     data.get('allow_until')))
+                     data.get('allow_until'), data.get('study_until')))
                 db.commit()
         return data
 
-    def save_lease(self, mac, ip, hostname, lease_time=None, router=None, allow_until=None):
+    def save_lease(self, mac, ip, hostname, lease_time=None, router=None, allow_until=None,
+                   study_until=None):
         lease_time = lease_time or config.DEFAULT_LEASE
         router = router or settings_store.get('new_device_mode') or config.NEW_DEVICE_MODE
         now = int(time.time())
@@ -286,11 +300,14 @@ class MemDB:
             prev = self.leases_by_mac.get(mac) or {}
             if allow_until is None:
                 allow_until = prev.get('allow_until')
+            if study_until is None:
+                study_until = prev.get('study_until')
         return self.upsert_lease({
             'mac': mac, 'ip': ip, 'hostname': hostname,
             'lease_start': now, 'lease_time': lease_time,
             'last_seen': now, 'router': router,
             'allow_until': allow_until,
+            'study_until': study_until,
         })
 
     def update_last_seen(self, mac):
@@ -395,7 +412,7 @@ class MemDB:
         return None
 
     def set_allow_until(self, mac, until_ts):
-        """Write-through allow_until on reservation (+ lease mirror)."""
+        """Write-through Free time (allow_until → ALL_ALLOW)."""
         mac = mac.strip().lower()
         with self.lock:
             if mac in self.res_by_mac:
@@ -410,6 +427,22 @@ class MemDB:
                 db.commit()
         self._touch_trigger()
 
+    def set_study_until(self, mac, until_ts):
+        """Write-through Extend study (study_until → STUDY outside schedule)."""
+        mac = mac.strip().lower()
+        with self.lock:
+            if mac in self.res_by_mac:
+                self.res_by_mac[mac]['study_until'] = until_ts
+            if mac in self.leases_by_mac:
+                self.leases_by_mac[mac]['study_until'] = until_ts
+            with self._db() as db:
+                if mac in self.res_by_mac:
+                    db.execute('UPDATE reservations SET study_until=? WHERE mac=?', (until_ts, mac))
+                if mac in self.leases_by_mac:
+                    db.execute('UPDATE leases SET study_until=? WHERE mac=?', (until_ts, mac))
+                db.commit()
+        self._touch_trigger()
+
     def clear_expired_allows(self):
         now = int(time.time())
         changed = []
@@ -419,9 +452,14 @@ class MemDB:
             with self.lock:
                 r = self.res_by_mac.get(mac) or self.leases_by_mac.get(mac) or {}
                 au = r.get('allow_until')
+                su = r.get('study_until')
             if au is not None and int(au) <= now:
                 self.set_allow_until(mac, None)
                 changed.append(mac)
+            if su is not None and int(su) <= now:
+                self.set_study_until(mac, None)
+                if mac not in changed:
+                    changed.append(mac)
         return changed
 
     # Back-compat names used by older call sites / peer sync
@@ -603,10 +641,11 @@ def allow_expiry_watcher():
             for mac, r in items:
                 mode = r.get('router') or 'default'
                 au = r.get('allow_until')
-                eff = policy.effective_mode(mode, au, **kw)
+                su = r.get('study_until')
+                eff = policy.effective_mode(mode, au, study_until=su, **kw)
                 if prev_eff.get(mac) == eff and mac not in expired:
                     continue
-                got, ok, msg = apply_mac_policy(mac, mode, au)
+                got, ok, msg = apply_mac_policy(mac, mode, au, su)
                 app_log.info(
                     f"[POLICY] {mac} mode={policy.normalize_mode(mode)} -> {got} "
                     f"ok={ok}{' (expire)' if mac in expired else ''}")
@@ -719,7 +758,20 @@ TPL_EDIT = '''
 </form>
 {% if mode=='study' %}
 <hr>
-<h3>Temporary all_allow (study only)</h3>
+<h3>1. Extend study</h3>
+<p>STUDY kept (blocks stay). Study until: {{ reservation.study_until_fmt or '—' }}</p>
+<form action="{{ url_for('grant_study', mac=reservation.mac) }}" method="post">
+  <button name="kind" value="30m">+30m</button>
+  <button name="kind" value="1h">+1h</button>
+  <button name="kind" value="4h">+4h</button>
+  <button name="kind" value="1d">until midnight</button>
+</form>
+<form action="{{ url_for('clear_study', mac=reservation.mac) }}" method="post" style="margin-top:8px">
+  <button type="submit">Clear study extend</button>
+</form>
+<hr>
+<h3>2. Free time (all_allow)</h3>
+<p>Free until: {{ reservation.allow_until_fmt or '—' }}</p>
 <form action="{{ url_for('grant_allow', mac=reservation.mac) }}" method="post">
   <button name="kind" value="30m">+30m</button>
   <button name="kind" value="1h">+1h</button>
@@ -727,7 +779,7 @@ TPL_EDIT = '''
   <button name="kind" value="1d">until midnight</button>
 </form>
 <form action="{{ url_for('clear_allow', mac=reservation.mac) }}" method="post" style="margin-top:8px">
-  <button type="submit">Clear allow (back to study)</button>
+  <button type="submit">Clear free time</button>
 </form>
 {% endif %}
 <p><a href="{{ url_for('delete_reservation_route', mac=reservation.mac) }}">Delete reservation</a></p>
@@ -793,23 +845,30 @@ TPL_HISTORY = '''
 '''
 
 
+def _fmt_ts(ts):
+    if not ts:
+        return ''
+    try:
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(ts)))
+    except Exception:
+        return str(ts)
+
+
 def _enrich(row):
     gw = settings_store.get('gateway') or config.GATEWAY
     mode = policy.normalize_mode(row.get('router'), gw)
     au = row.get('allow_until')
+    su = row.get('study_until')
     kw = _sched()
-    # router 원본(IP/모드)을 넘겨 custom GW 판정 유지
     eff = policy.effective_mode(
         row.get('router') or mode, au,
         study_start=kw['study_start'], study_end=kw['study_end'],
-        gateway=gw)
-    au_fmt = ''
-    if au:
-        try:
-            au_fmt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(au)))
-        except Exception:
-            au_fmt = str(au)
-    return {**row, 'mode': mode, 'effective': eff, 'allow_until_fmt': au_fmt}
+        gateway=gw, study_until=su)
+    return {
+        **row, 'mode': mode, 'effective': eff,
+        'allow_until_fmt': _fmt_ts(au),
+        'study_until_fmt': _fmt_ts(su),
+    }
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -899,7 +958,31 @@ def edit_reservation(mac):
             })
     en = _enrich(r)
     return render_template_string(
-        TPL_EDIT, reservation=r, mode=en['mode'], effective=en['effective'], safe=config.SAFE_MODE)
+        TPL_EDIT, reservation=en, mode=en['mode'], effective=en['effective'], safe=config.SAFE_MODE)
+
+
+@app.route('/grant_study/<mac>', methods=['POST'])
+@web_auth.login_required
+def grant_study(mac):
+    mac = mac.strip().lower()
+    kind = request.form.get('kind', '30m')
+    row = MEMDB.device_row(mac)
+    if not row or policy.normalize_mode(row.get('router')) != 'study':
+        return "<script>alert('study device only');history.back();</script>"
+    until = policy.compute_study_until(kind)
+    MEMDB.set_study_until(mac, until)
+    apply_mac_policy(mac, 'study', study_until=until)
+    app_log.info(f"[STUDY-EXTEND] {mac} kind={kind} until={until}")
+    return redirect(url_for('edit_reservation', mac=mac))
+
+
+@app.route('/clear_study/<mac>', methods=['POST'])
+@web_auth.login_required
+def clear_study(mac):
+    mac = mac.strip().lower()
+    MEMDB.set_study_until(mac, None)
+    apply_mac_policy(mac, 'study', study_until=None)
+    return redirect(url_for('edit_reservation', mac=mac))
 
 
 @app.route('/grant_allow/<mac>', methods=['POST'])
@@ -912,7 +995,7 @@ def grant_allow(mac):
         return "<script>alert('study device only');history.back();</script>"
     until = policy.compute_allow_until(kind)
     MEMDB.set_allow_until(mac, until)
-    apply_mac_policy(mac, 'study', until)
+    apply_mac_policy(mac, 'study', allow_until=until)
     app_log.info(f"[ALLOW-GRANT] {mac} kind={kind} until={until}")
     return redirect(url_for('edit_reservation', mac=mac))
 
@@ -922,7 +1005,7 @@ def grant_allow(mac):
 def clear_allow(mac):
     mac = mac.strip().lower()
     MEMDB.set_allow_until(mac, None)
-    apply_mac_policy(mac, 'study', None)
+    apply_mac_policy(mac, 'study', allow_until=None)
     return redirect(url_for('edit_reservation', mac=mac))
 
 

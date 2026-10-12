@@ -147,7 +147,11 @@ class MemDB:
             self.reservations_by_ip = {}
             self.reservations_by_mac = {}
             cols = [r[1] for r in db.execute('PRAGMA table_info(reservations)')]
-            extra = ', allow_until' if 'allow_until' in cols else ''
+            extra = ''
+            if 'allow_until' in cols:
+                extra += ', allow_until'
+            if 'study_until' in cols:
+                extra += ', study_until'
             for r in db.execute(
                     f'SELECT mac,ip,hostname,lease_time,router,desc{extra} FROM reservations'):
                 d = dict(r)
@@ -158,9 +162,14 @@ class MemDB:
             self.leases_by_ip = {}
             self.leases_by_mac = {}
             cols = [r[1] for r in db.execute('PRAGMA table_info(leases)')]
-            extra = ', allow_until' if 'allow_until' in cols else ''
+            extra = ''
+            if 'allow_until' in cols:
+                extra += ', allow_until'
+            if 'study_until' in cols:
+                extra += ', study_until'
             for r in db.execute(
-                    f'SELECT mac,ip,hostname,lease_start,lease_time,last_seen,router{extra} FROM leases'):
+                    f'SELECT mac,ip,hostname,lease_start,lease_time,last_seen,router{extra} '
+                    f'FROM leases'):
                 d = dict(r)
                 if r['ip']:
                     self.leases_by_ip[r['ip']] = d
@@ -205,7 +214,8 @@ class MemDB:
         if not row:
             return policy.effective_mode('default', None, **kw)
         return policy.effective_mode(
-            policy.normalize_mode(row.get('router')), row.get('allow_until'), **kw)
+            policy.normalize_mode(row.get('router')), row.get('allow_until'),
+            study_until=row.get('study_until'), **kw)
     @staticmethod
     def normalize(name: str) -> str:
         return (name or '').rstrip('.').lower()
