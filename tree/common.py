@@ -200,25 +200,19 @@ def is_router(db,ip=None):
 
 def dhcp_server_identity(iface=None):
     """
-    Ethernet src MAC + IPv4 used in DHCP OFFER/ACK/NAK.
-    Must come from the live LAN iface (Settings internal / INB), not from
-    config.INTERFACE at import time (often empty → 00:00:00:00:00:00).
+    Ethernet src MAC + IPv4 for DHCP OFFER/ACK/NAK.
+    Always Settings Internal (IN) — never a separate hardcoded NIC.
     """
-    if not iface:
-        iface = (os.environ.get('INB') or os.environ.get('KROUTER_INTERNAL_IF')
-                 or getattr(config, 'INTERFACE', '') or '').strip()
-        if not iface:
-            try:
-                import settings_store
-                iface = (settings_store.internal_device() or '').strip()
-            except Exception:
-                iface = ''
+    import settings_store
+    iface = (iface or settings_store.internal_device() or '').strip()
     mac = get_interface_mac(iface) if iface else None
     if not mac or mac == '00:00:00:00:00:00':
         mac = getattr(config, 'SERVER_MAC', None) or '00:00:00:00:00:00'
     ip = get_interface_ip(iface) if iface else None
     if not ip:
-        ip = getattr(config, 'SERVER_IP', None) or '192.168.0.1'
+        ip = (settings_store.gateway_ip()
+              or getattr(config, 'SERVER_IP', None)
+              or '192.168.0.1')
     return mac, ip
 
 

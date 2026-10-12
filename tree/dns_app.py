@@ -39,6 +39,7 @@ if not app_log.handlers:
 
 web_auth.ensure_admin_password(config.ADMIN_USER, config.ADMIN_PASSWORD)
 settings_store.ensure_tables()
+settings_store.apply_runtime()  # Settings IN/OUT/GW/DNS → config + env
 
 app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
@@ -376,9 +377,14 @@ class DNSServer:
 
 
 def dns_server_thread():
-    iface = settings_store.internal_device()
-    host_ip = common.get_interface_ip(iface) or '127.0.0.1'
-    app_log.info(f"[INFO] DNS bind {host_ip}:53 on {iface} wan={settings_store.wan_device()}")
+    rt = settings_store.apply_runtime()
+    iface = rt.get('INB') or settings_store.internal_device()
+    host_ip = rt.get('SERVER_IP') or common.get_interface_ip(iface) or '127.0.0.1'
+    app_log.info(
+        f"[INFO] DNS bind {host_ip}:53 on IN={iface} OUT={rt.get('OUT')}")
+    if not iface:
+        app_log.error("[ERROR] Settings internal_device (IN) empty — DNS not binding")
+        return
     DNSServer(host=host_ip, port=53).serve_forever()
 
 

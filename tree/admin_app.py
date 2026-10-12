@@ -38,6 +38,7 @@ os.makedirs(os.path.join(config.KROUTER_ROOT, 'data'), exist_ok=True)
 # 기본 admin/admin (settings.db 에 이미 hash 있으면 유지 — 아래에서 강제 리셋 옵션 없음)
 web_auth.ensure_admin_password(config.ADMIN_USER, config.ADMIN_PASSWORD)
 settings_store.ensure_tables()
+settings_store.apply_runtime()  # Settings IN/OUT/GW/DNS → config + env
 
 app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
@@ -1009,12 +1010,15 @@ def settings_page():
         })
         if npw:
             settings_store.set_value('admin_password_hash', web_auth.hash_password(npw))
+        rt = settings_store.apply_runtime()
         path = router_ctl.write_block_allow_conf(allow_rules)
         ok, msg = router_ctl.refresh_block()
         arp_ok, arp_msg = router_ctl.apply_arp_table_size(arp_size)
         log.info(
-            f"[SETTINGS] saved ifaces IN={internal} WAN={wan} auto={auto_s}-{auto_e} "
-            f"arp={arp_size} ok={arp_ok} block_allow -> {path} refresh_ok={ok} {msg.strip()} "
+            f"[SETTINGS] saved ifaces IN={rt.get('INB')} OUT={rt.get('OUT')} "
+            f"mac={rt.get('SERVER_MAC')} ip={rt.get('SERVER_IP')} "
+            f"auto={auto_s}-{auto_e} arp={arp_size} ok={arp_ok} "
+            f"block_allow -> {path} refresh_ok={ok} {msg.strip()} "
             f"arp_msg={arp_msg.strip()}")
         return redirect(url_for('settings_page'))
     s = settings_store.get_all()

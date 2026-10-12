@@ -36,6 +36,7 @@ app_log.addHandler(logging.StreamHandler())
 
 web_auth.ensure_admin_password(config.ADMIN_USER, config.ADMIN_PASSWORD)
 settings_store.ensure_tables()
+settings_store.apply_runtime()  # Settings IN/OUT/GW/DNS → config + env
 
 
 def decode_hostname(raw):
@@ -616,21 +617,20 @@ def allow_expiry_watcher():
 
 
 def run_dhcp():
-    iface = lan_iface()
+    rt = settings_store.apply_runtime()
+    iface = lan_iface()  # Settings Internal (IN) only
     auto_s, auto_e = settings_store.dhcp_auto_range()
-    smac, sip = common.dhcp_server_identity(iface)
-    # Keep config in sync for any leftover callers
-    if smac and smac != '00:00:00:00:00:00':
-        config.SERVER_MAC = smac
-    if sip:
-        config.SERVER_IP = sip
+    smac, sip = rt.get('SERVER_MAC'), rt.get('SERVER_IP')
     app_log.info(
-        f"[INFO] DHCP sniff on {iface} server={sip} mac={smac} "
-        f"auto_pool={auto_s}-{auto_e} wan={settings_store.wan_device()}")
+        f"[INFO] DHCP sniff on IN={iface} OUT={rt.get('OUT')} "
+        f"server={sip} mac={smac} auto_pool={auto_s}-{auto_e}")
+    if not iface:
+        app_log.error("[ERROR] Settings internal_device (IN) empty — cannot sniff")
+        return
     if not smac or smac == '00:00:00:00:00:00':
         app_log.error(
-            "[ERROR] SERVER_MAC is 00:00:00:00:00:00 — set Internal device in Settings; "
-            "clients will ignore OFFER")
+            "[ERROR] SERVER_MAC is 00:00:00:00:00:00 on IN=%s — clients will ignore OFFER",
+            iface)
     sniff(filter="udp and (port 67 or 68)", iface=iface, prn=handle_dhcp)
 
 

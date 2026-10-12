@@ -159,13 +159,25 @@ def policy_kwargs() -> dict:
 
 
 def internal_device() -> str:
-    v = get('internal_device') or getattr(config, 'INTERFACE', '') or ''
-    return str(v).strip()
+    """Settings Internal (IN / LAN). DB first, then env, then config."""
+    v = get('internal_device')
+    if v and str(v).strip():
+        return str(v).strip()
+    return (os.environ.get('INB')
+            or os.environ.get('KROUTER_INTERNAL_IF')
+            or getattr(config, 'INTERFACE', '')
+            or '').strip()
 
 
 def wan_device() -> str:
-    v = get('wan_device') or getattr(config, 'WAN_INTERFACE', '') or ''
-    return str(v).strip()
+    """Settings WAN (OUT). DB first, then env, then config."""
+    v = get('wan_device')
+    if v and str(v).strip():
+        return str(v).strip()
+    return (os.environ.get('OUT')
+            or os.environ.get('KROUTER_WAN_IF')
+            or getattr(config, 'WAN_INTERFACE', '')
+            or '').strip()
 
 
 def dhcp_auto_range() -> tuple[str, str]:
@@ -192,10 +204,63 @@ def iface_exists(name: str) -> bool:
 
 
 def router_env() -> dict[str, str]:
-    """router.sh / krouterctl 에 넘길 INB/OUT/DNS/GW."""
+    """router.sh / krouterctl 에 넘길 INB/OUT/DNS/GW — always from Settings."""
     return {
         'INB': internal_device(),
         'OUT': wan_device(),
         'SERVER_IP_DEFAULT': gateway_ip(),
         'ROUTER_DNS_IP': primary_dns_ip(),
+    }
+
+
+def apply_runtime() -> dict[str, str]:
+    """
+    Push Settings → process env + config so DHCP/DNS/iptables share one view.
+
+    IN  (internal_device) = LAN: DHCP sniff/send, DNS :53, MAC FORWARD rules
+    OUT (wan_device)      = WAN: NAT / FORWARD other side
+    """
+    inb = internal_device()
+    out = wan_device()
+    gw = gateway_ip()
+    dns = str(get('dns_servers') or primary_dns_ip()).strip()
+
+    config.INTERFACE = inb
+    config.WAN_INTERFACE = out
+    config.GATEWAY = gw
+    config.DNS_SERVERS = dns
+
+    os.environ['INB'] = inb
+    os.environ['OUT'] = out
+    os.environ['KROUTER_INTERNAL_IF'] = inb
+    os.environ['KROUTER_WAN_IF'] = out
+    os.environ['SERVER_IP_DEFAULT'] = gw
+    os.environ['ROUTER_DNS_IP'] = primary_dns_ip()
+
+    mac = '00:00:00:00:00:00'
+    sip = gw
+    if inb:
+        try:
+            from scapy.all import get_if_hwaddr
+            mac = get_if_hwaddr(inb) or mac
+        except Exception:
+            pass
+        try:
+            import netifaces
+            addrs = netifaces.ifaddresses(inb)
+            for a in addrs.get(netifaces.AF_INET, []) or []:
+                if a.get('addr'):
+                    sip = a['addr']
+                    break
+        except Exception:
+            pass
+    config.SERVER_MAC = mac
+    config.SERVER_IP = sip
+    return {
+        'INB': inb,
+        'OUT': out,
+        'SERVER_MAC': mac,
+        'SERVER_IP': sip,
+        'GATEWAY': gw,
+        'DNS': dns,
     }
