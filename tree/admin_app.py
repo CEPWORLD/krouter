@@ -542,6 +542,8 @@ def about_page():
 def devices():
     cols = ('mac', 'hostname', 'ip', 'mode', 'effective', 'allow_until', 'desc')
     sort, direction = _parse_sort(cols, 'hostname')
+    # Peer DHCP may have updated leases; reservations are Admin-written (already in mem)
+    dhc.MEMDB.sync_leases_from_disk()
     with dhc.MEMDB.lock:
         reservations = [dhc._enrich(r) for r in dhc.MEMDB.res_by_mac.values()]
     reservations = _sort_rows(reservations, sort, direction, {
@@ -564,6 +566,8 @@ def devices():
 def leases():
     cols = ('mac', 'ip', 'hostname', 'mode', 'effective', 'last_seen')
     sort, direction = _parse_sort(cols, 'ip')
+    dhc.MEMDB.sync_leases_from_disk()
+    dhc.MEMDB.maybe_sync_reservations()
     with dhc.MEMDB.lock:
         rows = [dhc._enrich(r) for r in dhc.MEMDB.leases_by_mac.values()]
     rows = _sort_rows(rows, sort, direction, {
@@ -584,6 +588,7 @@ def leases():
 def history():
     cols = ('mac', 'ip', 'hostname', 'mode', 'last_seen')
     sort, direction = _parse_sort(cols, 'last_seen')
+    dhc.MEMDB.sync_leases_from_disk()
     with dhc.MEMDB.lock:
         histories = list(dhc.MEMDB.history_by_mac.values())
     histories = _sort_rows(histories, sort, direction, {
@@ -618,14 +623,13 @@ def add_reservation():
     with dhc.MEMDB.lock:
         if mac in dhc.MEMDB.res_by_mac:
             return "<script>alert('Duplicate MAC');history.back();</script>"
-        dhc.MEMDB.res_by_mac[mac] = {
-            'mac': mac, 'ip': ip, 'hostname': hostname,
-            'lease_time': lease_time, 'router': router,
-            'desc': request.form.get('desc', '').strip(),
-            'allow_until': None,
-        }
+    dhc.MEMDB.upsert_reservation({
+        'mac': mac, 'ip': ip, 'hostname': hostname,
+        'lease_time': lease_time, 'router': router,
+        'desc': request.form.get('desc', '').strip(),
+        'allow_until': None,
+    })
     _eff, ok, msg = dhc.apply_mac_policy(mac, router, None)
-    dhc.MEMDB.flush_all()
     if not ok:
         return (
             f"<script>alert({json.dumps('Saved, but iptables apply failed: ' + (msg or '')[:200])});"
@@ -655,34 +659,30 @@ def edit_device(mac):
         with dhc.MEMDB.lock:
             prev = dhc.MEMDB.res_by_mac.get(mac) or {}
             au = prev.get('allow_until') if router == 'study' else None
-            dhc.MEMDB.res_by_mac[mac] = {
-                'mac': mac, 'ip': ip, 'hostname': hostname,
-                'lease_time': lease_time, 'router': router, 'desc': desc,
-                'allow_until': au,
-            }
-            if mac in dhc.MEMDB.leases_by_mac:
-                lr = dhc.MEMDB.leases_by_mac[mac]
-                lr.update({'ip': ip, 'hostname': hostname, 'router': router, 'allow_until': au})
+        dhc.MEMDB.upsert_reservation({
+            'mac': mac, 'ip': ip, 'hostname': hostname,
+            'lease_time': lease_time, 'router': router, 'desc': desc,
+            'allow_until': au,
+        })
         _eff, ok, msg = dhc.apply_mac_policy(mac, router, au)
-        dhc.MEMDB.flush_all()
         if not ok:
             return (
                 f"<script>alert({json.dumps('Saved, but iptables apply failed: ' + (msg or '')[:200])});"
                 f"location.href={json.dumps(url_for('devices'))}</script>")
         return redirect(url_for('devices'))
 
+    dhc.MEMDB.sync_leases_from_disk()
     with dhc.MEMDB.lock:
         r = dhc.MEMDB.res_by_mac.get(mac) or dhc.MEMDB.leases_by_mac.get(mac)
         if not r:
             return "<script>alert('not found');history.back();</script>"
-        if mac not in dhc.MEMDB.res_by_mac:
-            dhc.MEMDB.res_by_mac[mac] = {
-                'mac': mac, 'ip': r.get('ip'), 'hostname': r.get('hostname'),
-                'lease_time': r.get('lease_time') or config.DEFAULT_LEASE,
-                'router': r.get('router') or 'default',
-                'desc': '', 'allow_until': r.get('allow_until'),
-            }
-            r = dhc.MEMDB.res_by_mac[mac]
+    if mac not in dhc.MEMDB.res_by_mac:
+        r = dhc.MEMDB.upsert_reservation({
+            'mac': mac, 'ip': r.get('ip'), 'hostname': r.get('hostname'),
+            'lease_time': r.get('lease_time') or config.DEFAULT_LEASE,
+            'router': r.get('router') or 'default',
+            'desc': '', 'allow_until': r.get('allow_until'),
+        })
     en = dhc._enrich(r)
     return render_template_string(
         TPL_EDIT, reservation=r, mode=en['mode'], effective=en['effective'], **_ctx())
@@ -699,7 +699,6 @@ def grant_allow(mac):
     until = policy.compute_allow_until(kind)
     dhc.MEMDB.set_allow_until(mac, until)
     _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', until)
-    dhc.MEMDB.flush_all()
     if not ok:
         return (
             f"<script>alert({json.dumps('Allow saved, but iptables apply failed: ' + (msg or '')[:200])});"
@@ -713,7 +712,6 @@ def clear_allow(mac):
     mac = mac.strip().lower()
     dhc.MEMDB.set_allow_until(mac, None)
     _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', None)
-    dhc.MEMDB.flush_all()
     if not ok:
         return (
             f"<script>alert({json.dumps('Cleared in DB, but iptables apply failed: ' + (msg or '')[:200])});"
@@ -723,9 +721,7 @@ def clear_allow(mac):
 @app.route('/delete/<mac>')
 @web_auth.login_required
 def delete_device(mac):
-    with dhc.MEMDB.lock:
-        dhc.MEMDB.res_by_mac.pop(mac.strip().lower(), None)
-    dhc.MEMDB.flush_all()
+    dhc.MEMDB.delete_reservation(mac.strip().lower())
     return redirect(url_for('devices'))
 
 

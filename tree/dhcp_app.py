@@ -124,12 +124,9 @@ class MemDB:
     def _load_all(self):
         with self.lock, sqlite3.connect(self.db_path) as db:
             db.row_factory = sqlite3.Row
-            for r in db.execute('SELECT * FROM leases'):
-                self.leases_by_mac[r['mac']] = dict(r)
-            for r in db.execute('SELECT * FROM reservations'):
-                self.res_by_mac[r['mac']] = dict(r)
-            for r in db.execute('SELECT * FROM history'):
-                self.history_by_mac[r['mac']] = dict(r)
+            self.leases_by_mac = {r['mac']: dict(r) for r in db.execute('SELECT * FROM leases')}
+            self.res_by_mac = {r['mac']: dict(r) for r in db.execute('SELECT * FROM reservations')}
+            self.history_by_mac = {r['mac']: dict(r) for r in db.execute('SELECT * FROM history')}
             self.routers = [dict(r) for r in db.execute('SELECT * FROM routers ORDER BY ip')]
         self._policy_mtime = self._trigger_mtime()
         app_log.info(f"[MEMDB] Loaded leases={len(self.leases_by_mac)} res={len(self.res_by_mac)}")
@@ -140,90 +137,137 @@ class MemDB:
         except Exception:
             return 0.0
 
-    def pull_admin_writes(self) -> bool:
-        """
-        Admin (UI) and DHCP are separate processes with separate MemDB copies.
-        Admin owns reservations (mode / allow_until / static IP). DHCP must pull
-        those rows from sqlite before flush or iptables apply — otherwise the
-        30s periodic_flush and DHCP renew overwrite grants with stale memory.
-        """
-        changed = False
-        with self.lock, sqlite3.connect(self.db_path) as db:
-            db.row_factory = sqlite3.Row
-            disk_res = {r['mac']: dict(r) for r in db.execute('SELECT * FROM reservations')}
-            if disk_res != self.res_by_mac:
-                changed = True
-            self.res_by_mac = disk_res
-            for mac, d in disk_res.items():
-                if mac not in self.leases_by_mac:
-                    continue
-                lr = self.leases_by_mac[mac]
-                for k in ('router', 'allow_until', 'ip', 'hostname', 'lease_time'):
-                    if k in d and lr.get(k) != d.get(k):
-                        lr[k] = d.get(k)
-                        changed = True
-        self._policy_mtime = self._trigger_mtime()
-        if changed:
-            app_log.info(f"[MEMDB] pulled admin reservations res={len(self.res_by_mac)}")
-        return changed
-
-    def maybe_pull_admin(self, force: bool = False) -> bool:
-        if force or self._trigger_mtime() != getattr(self, '_policy_mtime', None):
-            return self.pull_admin_writes()
-        return False
-
-    def flush_all(self):
-        with self.lock, sqlite3.connect(self.db_path) as db:
-            db.execute('DELETE FROM leases')
-            db.execute('DELETE FROM reservations')
-            db.execute('DELETE FROM history')
-            db.execute('DELETE FROM routers')
-            for m, r in self.leases_by_mac.items():
-                db.execute(
-                    'INSERT OR REPLACE INTO leases '
-                    '(mac,ip,hostname,lease_start,lease_time,last_seen,router,allow_until) '
-                    'VALUES (?,?,?,?,?,?,?,?)',
-                    (m, r.get('ip'), r.get('hostname'), r.get('lease_start'),
-                     r.get('lease_time'), r.get('last_seen'), r.get('router'),
-                     r.get('allow_until')))
-            for m, r in self.res_by_mac.items():
-                db.execute(
-                    'INSERT OR REPLACE INTO reservations '
-                    '(mac,ip,hostname,lease_time,router,desc,allow_until) VALUES (?,?,?,?,?,?,?)',
-                    (m, r.get('ip'), r.get('hostname'), r.get('lease_time'),
-                     r.get('router'), r.get('desc'), r.get('allow_until')))
-            for m, r in self.history_by_mac.items():
-                db.execute(
-                    'INSERT OR REPLACE INTO history (mac,ip,hostname,last_seen,router) VALUES (?,?,?,?,?)',
-                    (m, r.get('ip'), r.get('hostname'), r.get('last_seen'), r.get('router')))
-            for r in self.routers:
-                db.execute('INSERT OR REPLACE INTO routers (ip, desc) VALUES (?, ?)',
-                           (r['ip'], r.get('desc')))
-            db.commit()
-        # DNS + peer-process policy reload trigger
+    def _touch_trigger(self):
+        """Notify peer processes (DHCP/DNS) that sqlite policy data changed."""
         try:
             open(config.trigger, 'a').close()
         except Exception:
             pass
         self._policy_mtime = self._trigger_mtime()
 
-    def periodic_flush(self, interval=30):
-        while True:
-            try:
-                # Pull Admin grants/mode changes before writing, or we clobber them.
-                self.pull_admin_writes()
-                self.flush_all()
-            except Exception as e:
-                app_log.error(f"[MEMDB] flush error: {e}")
-            time.sleep(interval)
+    def _db(self):
+        db = sqlite3.connect(self.db_path, timeout=30)
+        db.row_factory = sqlite3.Row
+        return db
 
-    def get_reservation(self, mac): 
-        with self.lock:
-            return self.res_by_mac.get(mac)
+    def sync_reservations_from_disk(self) -> bool:
+        """
+        Read-only refresh of reservations into MemDB (other process wrote sqlite).
+        Never writes sqlite from this path — avoids dual-writer clobber.
+        """
+        changed = False
+        with self.lock, self._db() as db:
+            disk_res = {r['mac']: dict(r) for r in db.execute('SELECT * FROM reservations')}
+            if disk_res != self.res_by_mac:
+                changed = True
+            self.res_by_mac = disk_res
+            for mac, d in disk_res.items():
+                lr = self.leases_by_mac.get(mac)
+                if not lr:
+                    continue
+                for k in ('router', 'allow_until', 'ip', 'hostname', 'lease_time'):
+                    if lr.get(k) != d.get(k):
+                        lr[k] = d.get(k)
+                        changed = True
+        self._policy_mtime = self._trigger_mtime()
+        if changed:
+            app_log.info(f"[MEMDB] synced reservations from disk res={len(self.res_by_mac)}")
+        return changed
 
-    def get_lease(self, mac):
+    def sync_leases_from_disk(self) -> bool:
+        """Read-only refresh of leases (DHCP process is lease writer)."""
+        changed = False
+        with self.lock, self._db() as db:
+            disk = {r['mac']: dict(r) for r in db.execute('SELECT * FROM leases')}
+            if disk != self.leases_by_mac:
+                changed = True
+            self.leases_by_mac = disk
+            disk_hist = {r['mac']: dict(r) for r in db.execute('SELECT * FROM history')}
+            self.history_by_mac = disk_hist
+        return changed
+
+    def maybe_sync_reservations(self, force: bool = False) -> bool:
+        if force or self._trigger_mtime() != getattr(self, '_policy_mtime', None):
+            return self.sync_reservations_from_disk()
+        return False
+
+    # --- write-through APIs: always MemDB + sqlite together; no full-table rewrite ---
+
+    def upsert_reservation(self, row: dict):
+        mac = str(row['mac']).strip().lower()
+        data = {
+            'mac': mac,
+            'ip': row.get('ip'),
+            'hostname': row.get('hostname'),
+            'lease_time': row.get('lease_time') or config.DEFAULT_LEASE,
+            'router': row.get('router') or 'default',
+            'desc': row.get('desc') or '',
+            'allow_until': row.get('allow_until'),
+        }
         with self.lock:
-            return self.leases_by_mac.get(mac)
+            self.res_by_mac[mac] = data
+            if mac in self.leases_by_mac:
+                lr = self.leases_by_mac[mac]
+                lr['router'] = data['router']
+                lr['allow_until'] = data['allow_until']
+                if data.get('ip'):
+                    lr['ip'] = data['ip']
+                if data.get('hostname'):
+                    lr['hostname'] = data['hostname']
+                if data.get('lease_time'):
+                    lr['lease_time'] = data['lease_time']
+            with self._db() as db:
+                db.execute(
+                    'INSERT OR REPLACE INTO reservations '
+                    '(mac,ip,hostname,lease_time,router,desc,allow_until) VALUES (?,?,?,?,?,?,?)',
+                    (mac, data['ip'], data['hostname'], data['lease_time'],
+                     data['router'], data['desc'], data['allow_until']))
+                if mac in self.leases_by_mac:
+                    db.execute(
+                        'UPDATE leases SET ip=?, hostname=?, lease_time=?, router=?, allow_until=? WHERE mac=?',
+                        (self.leases_by_mac[mac].get('ip'), self.leases_by_mac[mac].get('hostname'),
+                         self.leases_by_mac[mac].get('lease_time'), data['router'],
+                         data['allow_until'], mac))
+                db.commit()
+        self._touch_trigger()
+        return data
+
+    def delete_reservation(self, mac: str):
+        mac = mac.strip().lower()
+        with self.lock:
+            self.res_by_mac.pop(mac, None)
+            with self._db() as db:
+                db.execute('DELETE FROM reservations WHERE mac=?', (mac,))
+                db.commit()
+        self._touch_trigger()
+
+    def upsert_lease(self, row: dict):
+        """DHCP lease write-through. Policy fields follow reservation when present."""
+        mac = str(row['mac']).strip().lower()
+        with self.lock:
+            res = self.res_by_mac.get(mac)
+            data = dict(row)
+            data['mac'] = mac
+            if res:
+                data['router'] = res.get('router') or data.get('router') or 'default'
+                data['allow_until'] = res.get('allow_until')
+                if res.get('ip'):
+                    data['ip'] = res.get('ip')
+                if res.get('hostname'):
+                    data['hostname'] = res.get('hostname')
+                if res.get('lease_time'):
+                    data['lease_time'] = res.get('lease_time')
+            self.leases_by_mac[mac] = data
+            with self._db() as db:
+                db.execute(
+                    'INSERT OR REPLACE INTO leases '
+                    '(mac,ip,hostname,lease_start,lease_time,last_seen,router,allow_until) '
+                    'VALUES (?,?,?,?,?,?,?,?)',
+                    (mac, data.get('ip'), data.get('hostname'), data.get('lease_start'),
+                     data.get('lease_time'), data.get('last_seen'), data.get('router'),
+                     data.get('allow_until')))
+                db.commit()
+        return data
 
     def save_lease(self, mac, ip, hostname, lease_time=None, router=None, allow_until=None):
         lease_time = lease_time or config.DEFAULT_LEASE
@@ -233,34 +277,51 @@ class MemDB:
             prev = self.leases_by_mac.get(mac) or {}
             if allow_until is None:
                 allow_until = prev.get('allow_until')
-            self.leases_by_mac[mac] = {
-                'mac': mac, 'ip': ip, 'hostname': hostname,
-                'lease_start': now, 'lease_time': lease_time,
-                'last_seen': now, 'router': router,
-                'allow_until': allow_until,
-            }
+        return self.upsert_lease({
+            'mac': mac, 'ip': ip, 'hostname': hostname,
+            'lease_start': now, 'lease_time': lease_time,
+            'last_seen': now, 'router': router,
+            'allow_until': allow_until,
+        })
 
     def update_last_seen(self, mac):
-        with self.lock:
-            r = self.leases_by_mac.get(mac)
-            if r:
-                r['last_seen'] = int(time.time())
-
-    def del_lease_by_mac(self, mac):
-        with self.lock:
-            self.leases_by_mac.pop(mac, None)
-
-    def move_to_history(self, mac):
+        now = int(time.time())
         with self.lock:
             r = self.leases_by_mac.get(mac)
             if not r:
                 return
-            self.history_by_mac[mac] = {
+            r['last_seen'] = now
+            with self._db() as db:
+                db.execute('UPDATE leases SET last_seen=? WHERE mac=?', (now, mac))
+                db.commit()
+
+    def del_lease_by_mac(self, mac):
+        mac = mac.strip().lower()
+        with self.lock:
+            self.leases_by_mac.pop(mac, None)
+            with self._db() as db:
+                db.execute('DELETE FROM leases WHERE mac=?', (mac,))
+                db.commit()
+
+    def move_to_history(self, mac):
+        mac = mac.strip().lower()
+        with self.lock:
+            r = self.leases_by_mac.get(mac)
+            if not r:
+                return
+            hist = {
                 'mac': mac, 'ip': r.get('ip'), 'hostname': r.get('hostname'),
                 'last_seen': r.get('last_seen') or int(time.time()),
                 'router': r.get('router'),
             }
+            self.history_by_mac[mac] = hist
             self.leases_by_mac.pop(mac, None)
+            with self._db() as db:
+                db.execute(
+                    'INSERT OR REPLACE INTO history (mac,ip,hostname,last_seen,router) VALUES (?,?,?,?,?)',
+                    (mac, hist['ip'], hist['hostname'], hist['last_seen'], hist['router']))
+                db.execute('DELETE FROM leases WHERE mac=?', (mac,))
+                db.commit()
 
     def get_all_assigned_ips(self):
         with self.lock:
@@ -279,39 +340,70 @@ class MemDB:
 
     def add_router(self, ip, desc):
         with self.lock:
+            found = False
             for r in self.routers:
                 if r['ip'] == ip:
                     r['desc'] = desc
-                    return
-            self.routers.append({'ip': ip, 'desc': desc})
+                    found = True
+                    break
+            if not found:
+                self.routers.append({'ip': ip, 'desc': desc})
+            with self._db() as db:
+                db.execute('INSERT OR REPLACE INTO routers (ip, desc) VALUES (?, ?)', (ip, desc))
+                db.commit()
 
     def del_router(self, ip):
         with self.lock:
             self.routers = [r for r in self.routers if r['ip'] != ip]
+            with self._db() as db:
+                db.execute('DELETE FROM routers WHERE ip=?', (ip,))
+                db.commit()
 
     def device_row(self, mac):
-        """reservation 우선, 없으면 lease."""
+        """reservation 우선, 없으면 lease. Always from MemDB."""
         with self.lock:
             return self.res_by_mac.get(mac) or self.leases_by_mac.get(mac)
 
     def set_allow_until(self, mac, until_ts):
+        """Write-through allow_until on reservation (+ lease mirror)."""
+        mac = mac.strip().lower()
         with self.lock:
             if mac in self.res_by_mac:
                 self.res_by_mac[mac]['allow_until'] = until_ts
             if mac in self.leases_by_mac:
                 self.leases_by_mac[mac]['allow_until'] = until_ts
+            with self._db() as db:
+                if mac in self.res_by_mac:
+                    db.execute('UPDATE reservations SET allow_until=? WHERE mac=?', (until_ts, mac))
+                if mac in self.leases_by_mac:
+                    db.execute('UPDATE leases SET allow_until=? WHERE mac=?', (until_ts, mac))
+                db.commit()
+        self._touch_trigger()
 
     def clear_expired_allows(self):
         now = int(time.time())
         changed = []
         with self.lock:
-            for store in (self.res_by_mac, self.leases_by_mac):
-                for mac, r in store.items():
-                    au = r.get('allow_until')
-                    if au is not None and int(au) <= now:
-                        r['allow_until'] = None
-                        changed.append(mac)
-        return list(dict.fromkeys(changed))
+            macs = set(self.res_by_mac) | set(self.leases_by_mac)
+        for mac in macs:
+            with self.lock:
+                r = self.res_by_mac.get(mac) or self.leases_by_mac.get(mac) or {}
+                au = r.get('allow_until')
+            if au is not None and int(au) <= now:
+                self.set_allow_until(mac, None)
+                changed.append(mac)
+        return changed
+
+    # Back-compat names used by older call sites / peer sync
+    def pull_admin_writes(self) -> bool:
+        return self.sync_reservations_from_disk()
+
+    def maybe_pull_admin(self, force: bool = False) -> bool:
+        return self.maybe_sync_reservations(force=force)
+
+    def flush_all(self):
+        """Deprecated no-op: writes are write-through. Kept so old callers do not wipe DB."""
+        app_log.warning("[MEMDB] flush_all() is a no-op — use upsert_*/set_allow_until write-through")
 
 
 MEMDB = MemDB(config.dhcp_db_file)
@@ -572,7 +664,7 @@ TPL_EDIT = '''
   <button type="submit">Clear allow (back to study)</button>
 </form>
 {% endif %}
-<p><a href="{{ url_for('delete_reservation', mac=reservation.mac) }}">Delete reservation</a></p>
+<p><a href="{{ url_for('delete_reservation_route', mac=reservation.mac) }}">Delete reservation</a></p>
 '''
 
 TPL_SETTINGS = '''
@@ -695,14 +787,13 @@ def add_reservation():
     with MEMDB.lock:
         if mac in MEMDB.res_by_mac:
             return f"<script>alert('Duplicate MAC');history.back();</script>"
-        MEMDB.res_by_mac[mac] = {
-            'mac': mac, 'ip': ip, 'hostname': hostname,
-            'lease_time': lease_time, 'router': router,
-            'desc': request.form.get('desc', '').strip(),
-            'allow_until': None,
-        }
+    MEMDB.upsert_reservation({
+        'mac': mac, 'ip': ip, 'hostname': hostname,
+        'lease_time': lease_time, 'router': router,
+        'desc': request.form.get('desc', '').strip(),
+        'allow_until': None,
+    })
     apply_mac_policy(mac, router, None)
-    MEMDB.flush_all()
     return redirect(url_for('index_list'))
 
 
@@ -721,19 +812,12 @@ def edit_reservation(mac):
         with MEMDB.lock:
             prev = MEMDB.res_by_mac.get(mac) or {}
             au = prev.get('allow_until') if router == 'study' else None
-            MEMDB.res_by_mac[mac] = {
-                'mac': mac, 'ip': ip, 'hostname': hostname,
-                'lease_time': lease_time, 'router': router, 'desc': desc,
-                'allow_until': au,
-            }
-            if mac in MEMDB.leases_by_mac:
-                lr = MEMDB.leases_by_mac[mac]
-                lr['ip'] = ip
-                lr['hostname'] = hostname
-                lr['router'] = router
-                lr['allow_until'] = au
+        MEMDB.upsert_reservation({
+            'mac': mac, 'ip': ip, 'hostname': hostname,
+            'lease_time': lease_time, 'router': router, 'desc': desc,
+            'allow_until': au,
+        })
         apply_mac_policy(mac, router, au)
-        MEMDB.flush_all()
         return redirect(url_for('index_list'))
     with MEMDB.lock:
         r = MEMDB.res_by_mac.get(mac) or MEMDB.leases_by_mac.get(mac)
@@ -741,13 +825,12 @@ def edit_reservation(mac):
             return "<script>alert('not found');history.back();</script>"
         # lease only → promote shell for edit
         if mac not in MEMDB.res_by_mac:
-            MEMDB.res_by_mac[mac] = {
+            r = MEMDB.upsert_reservation({
                 'mac': mac, 'ip': r.get('ip'), 'hostname': r.get('hostname'),
                 'lease_time': r.get('lease_time') or config.DEFAULT_LEASE,
                 'router': r.get('router') or 'default',
                 'desc': '', 'allow_until': r.get('allow_until'),
-            }
-            r = MEMDB.res_by_mac[mac]
+            })
     en = _enrich(r)
     return render_template_string(
         TPL_EDIT, reservation=r, mode=en['mode'], effective=en['effective'], safe=config.SAFE_MODE)
@@ -764,7 +847,6 @@ def grant_allow(mac):
     until = policy.compute_allow_until(kind)
     MEMDB.set_allow_until(mac, until)
     apply_mac_policy(mac, 'study', until)
-    MEMDB.flush_all()
     app_log.info(f"[ALLOW-GRANT] {mac} kind={kind} until={until}")
     return redirect(url_for('edit_reservation', mac=mac))
 
@@ -775,16 +857,13 @@ def clear_allow(mac):
     mac = mac.strip().lower()
     MEMDB.set_allow_until(mac, None)
     apply_mac_policy(mac, 'study', None)
-    MEMDB.flush_all()
     return redirect(url_for('edit_reservation', mac=mac))
 
 
 @app.route('/delete_reservation/<mac>')
 @web_auth.login_required
-def delete_reservation(mac):
-    with MEMDB.lock:
-        MEMDB.res_by_mac.pop(mac.strip().lower(), None)
-    MEMDB.flush_all()
+def delete_reservation_route(mac):
+    MEMDB.delete_reservation(mac.strip().lower())
     return redirect(url_for('index_list'))
 
 
@@ -870,7 +949,7 @@ def main():
     app_log.info(
         f"[INFO] DHCP service SAFE_MODE={config.SAFE_MODE} db={config.dhcp_db_file} "
         f"(UI → admin_app.py :{getattr(config, 'interface_admin_port', 15000)})")
-    threading.Thread(target=MEMDB.periodic_flush, args=(30,), daemon=True).start()
+    # no periodic full-DB flush — MemDB changes are write-through to sqlite
     threading.Thread(target=allow_expiry_watcher, daemon=True).start()
     threading.Thread(target=periodic_cleanup, daemon=True).start()
     if config.SAFE_MODE:
