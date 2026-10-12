@@ -56,23 +56,35 @@ def normalize_mode(raw: Optional[str], gateway: str = '192.168.0.1') -> str:
 def compute_allow_until(kind: str, now: Optional[datetime] = None) -> int:
     """
     kind: '30m' | '1h' | '4h' | '1d' | 또는 '<N>m' / '<N>h'
-    1d → 다음 로컬 자정(오늘이 아직이면 오늘 24:00 = 내일 00:00)
+    1d → 다음 로컬 자정(오늘 남은 구간 → 내일 00:00)
     """
     now = now or datetime.now()
     k = kind.strip().lower()
     if k in ('1d', 'day', '1day'):
-        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        # 이미 자정이면 바로 만료 방지: 다음 자정
-        if tomorrow <= now:
-            tomorrow = tomorrow + timedelta(days=1)
-        # 오늘 남은 구간: 다음날 00:00
         end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        if end <= now:
+            end = end + timedelta(days=1)
         return int(end.timestamp())
     if k.endswith('m') and k[:-1].isdigit():
         return int((now + timedelta(minutes=int(k[:-1]))).timestamp())
     if k.endswith('h') and k[:-1].isdigit():
         return int((now + timedelta(hours=int(k[:-1]))).timestamp())
     raise ValueError(f'unsupported allow kind: {kind}')
+
+
+def compute_allow_hm(hours: int, minutes: int, now: Optional[datetime] = None) -> int:
+    """Custom Free time: hours 0..8, minutes in {0,15,30,45}. At least 15m total."""
+    now = now or datetime.now()
+    h = int(hours)
+    m = int(minutes)
+    if h < 0 or h > 8:
+        raise ValueError('hours must be 0..8')
+    if m not in (0, 15, 30, 45):
+        raise ValueError('minutes must be 0, 15, 30, or 45')
+    total_m = h * 60 + m
+    if total_m < 15:
+        raise ValueError('duration must be at least 15 minutes')
+    return int((now + timedelta(minutes=total_m)).timestamp())
 
 
 def in_study_schedule(now: Optional[datetime] = None,
@@ -110,10 +122,9 @@ def effective_mode(mode: str,
     """
     반환: ALL_ALLOW | DEFAULT | STUDY | BLOCK
 
-    study 장비:
-      allow_until 유효 → ALL_ALLOW (Free time)
-      정규 스케줄 안이거나 study_until 유효 → STUDY (Extend study: 차단 유지, BLOCK만 해제)
-      그 외 → BLOCK
+    allow_until 유효 → ALL_ALLOW (Free time) for study *and* default.
+    study: schedule / study_until → STUDY, else BLOCK.
+    default: no grant → DEFAULT.
     custom GW → ALL_ALLOW.
     """
     kind = normalize_mode(mode, gateway)
@@ -121,11 +132,12 @@ def effective_mode(mode: str,
 
     if kind in ('all_allow', 'custom'):
         return 'ALL_ALLOW'
-    if kind == 'default':
-        return 'DEFAULT'
-    # Free time first (full unblock)
+    # Free time (YouTube/games) — temporary ALL_ALLOW, then back to base mode
     if _ts_active(allow_until, now_ts):
         return 'ALL_ALLOW'
+    if kind == 'default':
+        return 'DEFAULT'
+    # study
     now_dt = datetime.fromtimestamp(now_ts)
     if in_study_schedule(now_dt, study_start, study_end) or _ts_active(study_until, now_ts):
         return 'STUDY'

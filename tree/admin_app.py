@@ -279,7 +279,7 @@ TPL_EDIT = MENU + '''
 {% if mode=='study' %}
 <hr>
 <h3>1. Extend study</h3>
-<p>Stay on <b>STUDY</b> (YouTube etc. still blocked). Only lifts schedule BLOCK → STUDY until expiry.
+<p>Stay on <b>STUDY</b> (blocks stay). Only lifts schedule BLOCK → STUDY until expiry.
   Current: {{ reservation.study_until_fmt or '—' }}</p>
 <form action="{{ url_for('grant_study', mac=reservation.mac) }}" method="post">
   <button name="kind" value="30m">+30m</button>
@@ -287,12 +287,22 @@ TPL_EDIT = MENU + '''
   <button name="kind" value="4h">+4h</button>
   <button name="kind" value="1d">until midnight</button>
 </form>
+<form action="{{ url_for('grant_study', mac=reservation.mac) }}" method="post" style="margin-top:6px">
+  Hours
+  <select name="hours"><option value="0">0h</option><option value="1">1h</option><option value="2">2h</option><option value="3">3h</option><option value="4">4h</option><option value="5">5h</option><option value="6">6h</option><option value="7">7h</option><option value="8">8h</option></select>
+  Minutes
+  <select name="minutes"><option value="0">0m</option><option value="15">15m</option><option value="30" selected>30m</option><option value="45">45m</option></select>
+  <input type="hidden" name="kind" value="custom">
+  <button type="submit">Grant extend</button>
+</form>
 <form action="{{ url_for('clear_study', mac=reservation.mac) }}" method="post" style="margin-top:8px">
   <button type="submit">Clear study extend</button>
 </form>
+{% endif %}
+{% if mode in ('study', 'default') %}
 <hr>
-<h3>2. Free time (all_allow)</h3>
-<p>Temporary <b>ALL_ALLOW</b> — full unblock. When it expires, back to study schedule.
+<h3>{% if mode=='study' %}2. {% endif %}Free time (all_allow)</h3>
+<p>Temporary <b>ALL_ALLOW</b> — YouTube/games open. When it expires, back to <b>{{ mode }}</b>.
   Current: {{ reservation.allow_until_fmt or '—' }}</p>
 <form action="{{ url_for('grant_allow', mac=reservation.mac) }}" method="post">
   <button name="kind" value="30m">+30m</button>
@@ -300,8 +310,16 @@ TPL_EDIT = MENU + '''
   <button name="kind" value="4h">+4h</button>
   <button name="kind" value="1d">until midnight</button>
 </form>
+<form action="{{ url_for('grant_allow', mac=reservation.mac) }}" method="post" style="margin-top:6px">
+  Hours
+  <select name="hours"><option value="0">0h</option><option value="1">1h</option><option value="2">2h</option><option value="3">3h</option><option value="4">4h</option><option value="5">5h</option><option value="6">6h</option><option value="7">7h</option><option value="8">8h</option></select>
+  Minutes
+  <select name="minutes"><option value="0">0m</option><option value="15">15m</option><option value="30" selected>30m</option><option value="45">45m</option></select>
+  <input type="hidden" name="kind" value="custom">
+  <button type="submit">Grant free time</button>
+</form>
 <form action="{{ url_for('clear_allow', mac=reservation.mac) }}" method="post" style="margin-top:8px">
-  <button type="submit">Clear free time → back to study</button>
+  <button type="submit">Clear free time → back to {{ mode }}</button>
 </form>
 {% endif %}
 <p><a href="{{ url_for('delete_device', mac=reservation.mac) }}">Delete reservation</a></p>
@@ -677,7 +695,8 @@ def edit_device(mac):
             return "<script>alert('Invalid IP');history.back();</script>"
         with dhc.MEMDB.lock:
             prev = dhc.MEMDB.res_by_mac.get(mac) or {}
-            au = prev.get('allow_until') if router == 'study' else None
+            # Free time survives edits for study/default; Extend study only for study
+            au = prev.get('allow_until') if router in ('study', 'default') else None
             su = prev.get('study_until') if router == 'study' else None
         dhc.MEMDB.upsert_reservation({
             'mac': mac, 'ip': ip, 'hostname': hostname,
@@ -709,16 +728,31 @@ def edit_device(mac):
         TPL_EDIT, reservation=en, mode=en['mode'], effective=en['effective'], **_ctx())
 
 
+def _grant_until_from_form():
+    """Preset kind=30m|1h|4h|1d, or kind=custom with hours 0..8 + minutes 0/15/30/45."""
+    kind = (request.form.get('kind') or '30m').strip().lower()
+    if kind == 'custom':
+        try:
+            h = int(request.form.get('hours') or 0)
+            m = int(request.form.get('minutes') or 0)
+            return policy.compute_allow_hm(h, m)
+        except (TypeError, ValueError) as e:
+            raise ValueError(str(e)) from e
+    return policy.compute_allow_until(kind)
+
+
 @app.route('/grant_study/<mac>', methods=['POST'])
 @web_auth.login_required
 def grant_study(mac):
     """Extend study hours only — effective STUDY (blocks stay)."""
     mac = mac.strip().lower()
-    kind = request.form.get('kind', '30m')
     row = dhc.MEMDB.device_row(mac)
     if not row or policy.normalize_mode(row.get('router')) != 'study':
         return "<script>alert('study device only');history.back();</script>"
-    until = policy.compute_study_until(kind)
+    try:
+        until = _grant_until_from_form()
+    except ValueError as e:
+        return f"<script>alert({json.dumps(str(e))});history.back();</script>"
     dhc.MEMDB.set_study_until(mac, until)
     _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', study_until=until)
     if not ok:
@@ -732,8 +766,10 @@ def grant_study(mac):
 @web_auth.login_required
 def clear_study(mac):
     mac = mac.strip().lower()
+    row = dhc.MEMDB.device_row(mac) or {}
+    mode = policy.normalize_mode(row.get('router'))
     dhc.MEMDB.set_study_until(mac, None)
-    _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', study_until=None)
+    _eff, ok, msg = dhc.apply_mac_policy(mac, mode or 'study', study_until=None)
     if not ok:
         return (
             f"<script>alert({json.dumps('Cleared in DB, but iptables apply failed: ' + (msg or '')[:200])});"
@@ -744,14 +780,18 @@ def clear_study(mac):
 @app.route('/grant_allow/<mac>', methods=['POST'])
 @web_auth.login_required
 def grant_allow(mac):
+    """Free time for study or default → temporary ALL_ALLOW."""
     mac = mac.strip().lower()
-    kind = request.form.get('kind', '30m')
     row = dhc.MEMDB.device_row(mac)
-    if not row or policy.normalize_mode(row.get('router')) != 'study':
-        return "<script>alert('study device only');history.back();</script>"
-    until = policy.compute_allow_until(kind)
+    mode = policy.normalize_mode(row.get('router') if row else None)
+    if not row or mode not in ('study', 'default'):
+        return "<script>alert('study or default device only');history.back();</script>"
+    try:
+        until = _grant_until_from_form()
+    except ValueError as e:
+        return f"<script>alert({json.dumps(str(e))});history.back();</script>"
     dhc.MEMDB.set_allow_until(mac, until)
-    _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', allow_until=until)
+    _eff, ok, msg = dhc.apply_mac_policy(mac, mode, allow_until=until)
     if not ok:
         return (
             f"<script>alert({json.dumps('Allow saved, but iptables apply failed: ' + (msg or '')[:200])});"
@@ -763,8 +803,10 @@ def grant_allow(mac):
 @web_auth.login_required
 def clear_allow(mac):
     mac = mac.strip().lower()
+    row = dhc.MEMDB.device_row(mac) or {}
+    mode = policy.normalize_mode(row.get('router')) or 'default'
     dhc.MEMDB.set_allow_until(mac, None)
-    _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', allow_until=None)
+    _eff, ok, msg = dhc.apply_mac_policy(mac, mode, allow_until=None)
     if not ok:
         return (
             f"<script>alert({json.dumps('Cleared in DB, but iptables apply failed: ' + (msg or '')[:200])});"
