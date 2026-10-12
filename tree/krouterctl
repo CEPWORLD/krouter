@@ -9,13 +9,35 @@
 # Usage: ./krouterctl start|stop|restart|status|ui|fallback
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+# Prefer physical path so symlink ~/project/krouter-work ↔ /global/bin/krouter-work
+# does not leave orphan daemons that pgrep/pkill miss.
+ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 cd "$ROOT"
 
 RUN_DIR="${ROOT}/run"
 LOG_DIR="${ROOT}/logs"
 DATA_DIR="${ROOT}/data"
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$DATA_DIR"
+
+read_version() {
+  local f v
+  for f in "${ROOT}/VERSION" "$(dirname "$ROOT")/VERSION"; do
+    if [[ -f "$f" ]]; then
+      v="$(tr -d '[:space:]' <"$f" 2>/dev/null || true)"
+      if [[ -n "$v" ]]; then
+        echo "$v"
+        return 0
+      fi
+    fi
+  done
+  echo "?"
+}
+
+# Match both symlink and realpath cmdlines (*krouter-work*/admin_app.py).
+app_pgrep() {
+  local name="$1"
+  pgrep -f "krouter-work/.*/${name}_app\\.py" 2>/dev/null || true
+}
 
 if [[ -x "${ROOT}/venv/bin/python" ]]; then
   PY="${ROOT}/venv/bin/python"
@@ -52,9 +74,17 @@ logfile() { echo "${LOG_DIR}/${1}.ctl.log"; }
 is_running() {
   local name="$1" pf pid
   pf="$(pidfile "$name")"
-  # Prefer live process match — pidfile sometimes stores the wrapper bash pid.
-  pid="$(pgrep -f "${ROOT}/${name}_app.py" | head -1 || true)"
+  # Prefer live match (symlink OR realpath cmdline). Pidfile may be wrapper bash.
+  pid="$(app_pgrep "$name" | head -1 || true)"
   if [[ -n "$pid" ]]; then
+    # Prefer the python worker, not the wrapping bash -c
+    local p
+    for p in $(app_pgrep "$name"); do
+      if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q 'python'; then
+        pid="$p"
+        break
+      fi
+    done
     echo "$pid" >"$pf" 2>/dev/null || true
     return 0
   fi
@@ -139,6 +169,9 @@ start_one() {
     echo "[*] $name already running pid=$(cat "$pf")"
     return 0
   fi
+  # Clear orphans that is_running missed (path mismatch) before bind
+  sudo_cmd pkill -f "krouter-work/.*/${name}_app\\.py" 2>/dev/null || true
+  sleep 0.2
   cmd="$(cmd_for "$name")"
   # ensure INB/OUT available to children (router_ctl also loads settings.db)
   if [[ -z "${INB:-}" || -z "${OUT:-}" ]]; then
@@ -182,25 +215,31 @@ app_py() {
 }
 
 stop_one() {
-  local name="$1" pf pid py
+  local name="$1" pf pid pids
   pf="$(pidfile "$name")"
-  py="$(app_py "$name")"
-  if ! is_running "$name"; then
-    sudo_cmd pkill -f "$py" 2>/dev/null || true
+  pids="$(app_pgrep "$name")"
+  if [[ -z "$pids" ]]; then
     rm -f "$pf"
     echo "[*] $name not running"
     return 0
   fi
-  pid="$(cat "$pf")"
-  echo "[*] stopping $name pid=$pid"
-  sudo_cmd kill "$pid" 2>/dev/null || true
-  for _ in $(seq 1 15); do
-    kill -0 "$pid" 2>/dev/null || break
+  echo "[*] stopping $name pids=$(echo $pids | tr '\n' ' ')"
+  for pid in $pids; do
+    sudo_cmd kill "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 20); do
+    pids="$(app_pgrep "$name")"
+    [[ -z "$pids" ]] && break
     sleep 0.2
   done
-  if kill -0 "$pid" 2>/dev/null; then
-    sudo_cmd kill -9 "$pid" 2>/dev/null || true
+  pids="$(app_pgrep "$name")"
+  if [[ -n "$pids" ]]; then
+    for pid in $pids; do
+      sudo_cmd kill -9 "$pid" 2>/dev/null || true
+    done
   fi
+  # also clear any leftover by basename (bash wrappers)
+  sudo_cmd pkill -f "krouter-work/.*/${name}_app\\.py" 2>/dev/null || true
   rm -f "$pf"
   echo "[+] $name stopped"
 }
@@ -209,15 +248,9 @@ status_one() {
   local name="$1"
   local pf pid
   pf="$(pidfile "$name")"
-  # pidfile may lag; also detect by process command line
   if is_running "$name"; then
-    echo "  $name: RUNNING pid=$(cat "$pf")"
-    return 0
-  fi
-  pid="$(pgrep -f "${ROOT}/${name}_app.py" | head -1 || true)"
-  if [[ -n "$pid" ]]; then
-    echo "  $name: RUNNING pid=$pid (pidfile stale)"
-    echo "$pid" >"$pf" 2>/dev/null || true
+    pid="$(cat "$pf" 2>/dev/null || true)"
+    echo "  $name: RUNNING pid=${pid:-?}  etime=$(ps -o etime= -p "${pid:-0}" 2>/dev/null | tr -d ' ' || echo '?')"
     return 0
   fi
   echo "  $name: STOPPED"
@@ -279,10 +312,10 @@ do_stop() {
   for n in dns dhcp admin; do
     stop_one "$n" || true
   done
-  # orphan admin from manual runs
-  sudo_cmd pkill -f "${ROOT}/admin_app.py" 2>/dev/null || true
-  sudo_cmd pkill -f "${ROOT}/dhcp_app.py" 2>/dev/null || true
-  sudo_cmd pkill -f "${ROOT}/dns_app.py" 2>/dev/null || true
+  # orphans: any path under krouter-work (symlink or realpath)
+  sudo_cmd pkill -f 'krouter-work/.*/admin_app\.py' 2>/dev/null || true
+  sudo_cmd pkill -f 'krouter-work/.*/dhcp_app\.py' 2>/dev/null || true
+  sudo_cmd pkill -f 'krouter-work/.*/dns_app\.py' 2>/dev/null || true
   echo "[+] work stack stopped (네트워크 DHCP/DNS 없음 — 필요시 ./krouterctl fallback)"
 }
 
@@ -302,20 +335,25 @@ do_restart() {
 }
 
 do_status() {
-  echo "=== krouter-work STATUS SAFE_MODE=${KROUTER_SAFE_MODE} ==="
+  local ver host
+  ver="$(read_version)"
+  echo "=== krouter-work STATUS version=${ver} SAFE_MODE=${KROUTER_SAFE_MODE} ROOT=${ROOT} ==="
   local n
   for n in admin dhcp dns; do
     status_one "$n"
   done
   echo "  old dhcp.service: $(systemctl is-active dhcp.service 2>/dev/null || echo unknown)"
   echo "  old dns.service:  $(systemctl is-active dns.service 2>/dev/null || echo unknown)"
-  echo -n "  listen: "
+  echo -n "  listen udp 67/53: "
   ss -ulnp 2>/dev/null | grep -E ':(67|53) ' | awk '{print $5}' | tr '\n' ' ' || true
   echo
-  local host
+  echo -n "  listen tcp ${KROUTER_ADMIN_PORT}: "
+  ss -lntp 2>/dev/null | grep -E ":${KROUTER_ADMIN_PORT} " | head -3 || echo "(none)"
   host="$(hostname -I 2>/dev/null | awk '{print $1}')"
   if is_running admin; then
-    echo "UI http://${host:-192.168.0.1}:${KROUTER_ADMIN_PORT}/"
+    echo "UI http://${host:-192.168.0.1}:${KROUTER_ADMIN_PORT}/  (disk VERSION=${ver})"
+  else
+    echo "UI STOPPED — disk VERSION=${ver} (restart admin to load this version)"
   fi
 }
 

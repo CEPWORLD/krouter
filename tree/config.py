@@ -29,7 +29,7 @@ def _read_version() -> str:
                     return v
         except Exception:
             pass
-    return os.environ.get('KROUTER_VERSION', '6.4.135')
+    return os.environ.get('KROUTER_VERSION', '6.4.136')
 
 
 VERSION = _read_version()
