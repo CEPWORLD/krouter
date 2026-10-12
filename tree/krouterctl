@@ -147,6 +147,7 @@ start_one() {
   echo "[*] starting $name (SAFE_MODE=${KROUTER_SAFE_MODE}): $cmd"
   # dhcp/dns/admin 모두 동일 env, root로 (67/53 bind)
   # shellcheck disable=SC2086
+  # Also export KROUTER_*_IF — config.INTERFACE reads these at import (not INB alone).
   sudo_cmd env \
     KROUTER_SAFE_MODE="${KROUTER_SAFE_MODE}" \
     KROUTER_DRY_RUN="${KROUTER_DRY_RUN}" \
@@ -154,6 +155,8 @@ start_one() {
     KROUTER_ADMIN_PORT="${KROUTER_ADMIN_PORT}" \
     INB="${INB:-}" \
     OUT="${OUT:-}" \
+    KROUTER_INTERNAL_IF="${INB:-}" \
+    KROUTER_WAN_IF="${OUT:-}" \
     SERVER_IP_DEFAULT="${SERVER_IP_DEFAULT:-}" \
     ROUTER_DNS_IP="${ROUTER_DNS_IP:-}" \
     PYTHONUNBUFFERED=1 \

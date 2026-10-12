@@ -6,6 +6,7 @@
 #          in the subnet stay sticky until a human deletes them.
 #
 import ipaddress
+import os
 import sqlite3
 import time
 import threading
@@ -197,21 +198,47 @@ def is_router(db,ip=None):
 #DHCP_RELEASE = 7
 #DHCP_INFORM = 8
 
-def make_dhcp_nak(xid, chaddr):
-    return Ether(src=config.SERVER_MAC, dst="ff:ff:ff:ff:ff:ff") / \
-           IP(src=config.SERVER_IP, dst="255.255.255.255") / \
+def dhcp_server_identity(iface=None):
+    """
+    Ethernet src MAC + IPv4 used in DHCP OFFER/ACK/NAK.
+    Must come from the live LAN iface (Settings internal / INB), not from
+    config.INTERFACE at import time (often empty → 00:00:00:00:00:00).
+    """
+    if not iface:
+        iface = (os.environ.get('INB') or os.environ.get('KROUTER_INTERNAL_IF')
+                 or getattr(config, 'INTERFACE', '') or '').strip()
+        if not iface:
+            try:
+                import settings_store
+                iface = (settings_store.internal_device() or '').strip()
+            except Exception:
+                iface = ''
+    mac = get_interface_mac(iface) if iface else None
+    if not mac or mac == '00:00:00:00:00:00':
+        mac = getattr(config, 'SERVER_MAC', None) or '00:00:00:00:00:00'
+    ip = get_interface_ip(iface) if iface else None
+    if not ip:
+        ip = getattr(config, 'SERVER_IP', None) or '192.168.0.1'
+    return mac, ip
+
+
+def make_dhcp_nak(xid, chaddr, iface=None):
+    smac, sip = dhcp_server_identity(iface)
+    return Ether(src=smac, dst="ff:ff:ff:ff:ff:ff") / \
+           IP(src=sip, dst="255.255.255.255") / \
            UDP(sport=67, dport=68) / \
-           BOOTP(op=2, siaddr=config.SERVER_IP, chaddr=chaddr, xid=xid) / \
+           BOOTP(op=2, siaddr=sip, chaddr=chaddr, xid=xid) / \
            DHCP(options=[
                ("message-type", "nak"),
-               ("server_id", config.SERVER_IP),
+               ("server_id", sip),
                "end"
            ])
 
-def make_dhcp_offer(yiaddr, xid, chaddr, dns, gateway, lease_time, hostname=None):
+def make_dhcp_offer(yiaddr, xid, chaddr, dns, gateway, lease_time, hostname=None, iface=None):
+    smac, sip = dhcp_server_identity(iface)
     options=[
             ("message-type", "offer"),
-            ("server_id", config.SERVER_IP),
+            ("server_id", sip),
             ("subnet_mask", config.SUBNET_MASK),
             ("router", gateway),
             ("lease_time", lease_time),
@@ -221,16 +248,17 @@ def make_dhcp_offer(yiaddr, xid, chaddr, dns, gateway, lease_time, hostname=None
         options.append(("hostname",hostname))
     options.append("end")
 
-    return Ether(src=config.SERVER_MAC, dst="ff:ff:ff:ff:ff:ff") / \
-        IP(src=config.SERVER_IP, dst="255.255.255.255") / \
+    return Ether(src=smac, dst="ff:ff:ff:ff:ff:ff") / \
+        IP(src=sip, dst="255.255.255.255") / \
         UDP(sport=67, dport=68) / \
-        BOOTP(op=2, yiaddr=yiaddr, siaddr=config.SERVER_IP, chaddr=chaddr, xid=xid) / \
+        BOOTP(op=2, yiaddr=yiaddr, siaddr=sip, chaddr=chaddr, xid=xid) / \
         DHCP(options=options)
 
-def make_dhcp_ack(yiaddr, xid, chaddr, dns, gateway, lease_time,hostname=None):
+def make_dhcp_ack(yiaddr, xid, chaddr, dns, gateway, lease_time, hostname=None, iface=None):
+    smac, sip = dhcp_server_identity(iface)
     options=[
             ("message-type", "ack"),
-            ("server_id", config.SERVER_IP),
+            ("server_id", sip),
             ("subnet_mask", config.SUBNET_MASK),
             ("router", gateway),
             ("lease_time", lease_time),
@@ -240,10 +268,10 @@ def make_dhcp_ack(yiaddr, xid, chaddr, dns, gateway, lease_time,hostname=None):
         options.append(("hostname",hostname))
     options.append("end")
 
-    return Ether(src=config.SERVER_MAC, dst="ff:ff:ff:ff:ff:ff") / \
-        IP(src=config.SERVER_IP, dst="255.255.255.255") / \
+    return Ether(src=smac, dst="ff:ff:ff:ff:ff:ff") / \
+        IP(src=sip, dst="255.255.255.255") / \
         UDP(sport=67, dport=68) / \
-        BOOTP(op=2, yiaddr=yiaddr, siaddr=config.SERVER_IP, chaddr=chaddr, xid=xid) / \
+        BOOTP(op=2, yiaddr=yiaddr, siaddr=sip, chaddr=chaddr, xid=xid) / \
         DHCP(options=options)
 
 def seconds_to_human(seconds):

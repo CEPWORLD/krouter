@@ -497,8 +497,12 @@ def handle_dhcp(pkt):
                 break
             if isinstance(opt, tuple) and len(opt) == 2:
                 opts[opt[0]] = opt[1]
-        msg_type = opts.get('message-type')
-        if msg_type not in [1, 3, 6] or xid == 0:
+        raw_mt = opts.get('message-type')
+        # scapy may give int (1/3/6) or name ('discover'/'request'/…)
+        _mt_map = {1: 1, 2: 2, 3: 3, 6: 6,
+                   'discover': 1, 'offer': 2, 'request': 3, 'nak': 6, 'release': 7}
+        msg_type = _mt_map.get(raw_mt, raw_mt)
+        if msg_type not in (1, 3) or xid == 0:
             return
         gw = settings_store.get('gateway') or config.GATEWAY
         dns = settings_store.get('dns_servers') or config.DNS_SERVERS
@@ -507,16 +511,21 @@ def handle_dhcp(pkt):
         if msg_type == 1:
             offered_ip, hostname, router_field, lease_time, info, allow_until = get_offer_info(mac, opts)
             if not offered_ip:
-                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
+                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr, iface=iface),
+                      iface=iface, verbose=False)
                 return
             # Keep lease row in sync for RES/LEA/NEW (policy + Admin UI)
             MEMDB.save_lease(mac, offered_ip, hostname, lease_time, router_field, allow_until)
             apply_mac_policy(mac, router_field, allow_until)
             offer = common.make_dhcp_offer(
                 offered_ip, xid, pkt[BOOTP].chaddr, dns,
-                policy.pick_offer_gateway(router_field, gw), lease_time, hostname=hostname)
+                policy.pick_offer_gateway(router_field, gw), lease_time,
+                hostname=hostname, iface=iface)
             sendp(offer, iface=iface, verbose=False)
-            app_log.info(f"[DHCPOFFER] {mac} {offered_ip} mode={router_field} ({info})")
+            smac, sip = common.dhcp_server_identity(iface)
+            app_log.info(
+                f"[DHCPOFFER] {mac} {offered_ip} mode={router_field} ({info}) "
+                f"via {iface} src={smac}/{sip}")
 
         elif msg_type == 3:
             req_ip = opts.get('requested_addr')
@@ -525,26 +534,33 @@ def handle_dhcp(pkt):
                     req_ip = '.'.join(str(b) for b in req_ip)
                 except Exception:
                     req_ip = None
+            # Renew path: some clients put current IP in ciaddr and omit requested_addr
+            if not req_ip and getattr(bootp, 'ciaddr', None) and bootp.ciaddr != '0.0.0.0':
+                req_ip = str(bootp.ciaddr)
             offered_ip, hostname, router_field, lease_time, info, allow_until = get_offer_info(mac, opts)
             if not offered_ip:
-                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
+                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr, iface=iface),
+                      iface=iface, verbose=False)
                 app_log.info(f"[DHCPNAK] {mac} no offer available")
                 return
             # Client asking for wrong IP (e.g. old .152 while reserved .145) → NAK so it rediscovers.
             if req_ip and str(req_ip) != str(offered_ip):
                 app_log.info(
                     f"[DHCPNAK] {mac} requested {req_ip} but must use {offered_ip} ({info})")
-                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
+                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr, iface=iface),
+                      iface=iface, verbose=False)
                 return
             if req_ip and not common.ip_in_network(req_ip):
-                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr), iface=iface, verbose=False)
+                sendp(common.make_dhcp_nak(xid, pkt[BOOTP].chaddr, iface=iface),
+                      iface=iface, verbose=False)
                 return
             ack_ip = str(offered_ip)
             MEMDB.save_lease(mac, ack_ip, hostname, lease_time, router_field, allow_until)
             apply_mac_policy(mac, router_field, allow_until)
             ack = common.make_dhcp_ack(
                 ack_ip, xid, pkt[BOOTP].chaddr, dns,
-                policy.pick_offer_gateway(router_field, gw), lease_time, hostname=hostname)
+                policy.pick_offer_gateway(router_field, gw), lease_time,
+                hostname=hostname, iface=iface)
             sendp(ack, iface=iface, verbose=False)
             app_log.info(f"[DHCPACK] {mac} {ack_ip} mode={router_field} ({info})")
     except Exception as e:
@@ -602,10 +618,19 @@ def allow_expiry_watcher():
 def run_dhcp():
     iface = lan_iface()
     auto_s, auto_e = settings_store.dhcp_auto_range()
-    sip = common.get_interface_ip(iface) or config.SERVER_IP
+    smac, sip = common.dhcp_server_identity(iface)
+    # Keep config in sync for any leftover callers
+    if smac and smac != '00:00:00:00:00:00':
+        config.SERVER_MAC = smac
+    if sip:
+        config.SERVER_IP = sip
     app_log.info(
-        f"[INFO] DHCP sniff on {iface} server_ip={sip} "
+        f"[INFO] DHCP sniff on {iface} server={sip} mac={smac} "
         f"auto_pool={auto_s}-{auto_e} wan={settings_store.wan_device()}")
+    if not smac or smac == '00:00:00:00:00:00':
+        app_log.error(
+            "[ERROR] SERVER_MAC is 00:00:00:00:00:00 — set Internal device in Settings; "
+            "clients will ignore OFFER")
     sniff(filter="udp and (port 67 or 68)", iface=iface, prn=handle_dhcp)
 
 
