@@ -137,6 +137,10 @@ start_one() {
     return 0
   fi
   cmd="$(cmd_for "$name")"
+  # ensure INB/OUT available to children (router_ctl also loads settings.db)
+  if [[ -z "${INB:-}" || -z "${OUT:-}" ]]; then
+    load_settings_ifaces || true
+  fi
   echo "[*] starting $name (SAFE_MODE=${KROUTER_SAFE_MODE}): $cmd"
   # dhcp/dns/admin 모두 동일 env, root로 (67/53 bind)
   # shellcheck disable=SC2086
@@ -145,6 +149,10 @@ start_one() {
     KROUTER_DRY_RUN="${KROUTER_DRY_RUN}" \
     KROUTER_BIND="${KROUTER_BIND}" \
     KROUTER_ADMIN_PORT="${KROUTER_ADMIN_PORT}" \
+    INB="${INB:-}" \
+    OUT="${OUT:-}" \
+    SERVER_IP_DEFAULT="${SERVER_IP_DEFAULT:-}" \
+    ROUTER_DNS_IP="${ROUTER_DNS_IP:-}" \
     PYTHONUNBUFFERED=1 \
     bash -c "cd '${ROOT}' && nohup ${cmd} >>'${lf}' 2>&1 & echo \$! >'${pf}'"
   sleep 0.5

@@ -620,8 +620,12 @@ def add_reservation():
             'desc': request.form.get('desc', '').strip(),
             'allow_until': None,
         }
-    dhc.apply_mac_policy(mac, router, None)
+    _eff, ok, msg = dhc.apply_mac_policy(mac, router, None)
     dhc.MEMDB.flush_all()
+    if not ok:
+        return (
+            f"<script>alert({json.dumps('Saved, but iptables apply failed: ' + (msg or '')[:200])});"
+            f"location.href={json.dumps(url_for('devices'))}</script>")
     return redirect(url_for('devices'))
 
 
@@ -655,8 +659,12 @@ def edit_device(mac):
             if mac in dhc.MEMDB.leases_by_mac:
                 lr = dhc.MEMDB.leases_by_mac[mac]
                 lr.update({'ip': ip, 'hostname': hostname, 'router': router, 'allow_until': au})
-        dhc.apply_mac_policy(mac, router, au)
+        _eff, ok, msg = dhc.apply_mac_policy(mac, router, au)
         dhc.MEMDB.flush_all()
+        if not ok:
+            return (
+                f"<script>alert({json.dumps('Saved, but iptables apply failed: ' + (msg or '')[:200])});"
+                f"location.href={json.dumps(url_for('devices'))}</script>")
         return redirect(url_for('devices'))
 
     with dhc.MEMDB.lock:
@@ -686,8 +694,12 @@ def grant_allow(mac):
         return "<script>alert('study device only');history.back();</script>"
     until = policy.compute_allow_until(kind)
     dhc.MEMDB.set_allow_until(mac, until)
-    dhc.apply_mac_policy(mac, 'study', until)
+    _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', until)
     dhc.MEMDB.flush_all()
+    if not ok:
+        return (
+            f"<script>alert({json.dumps('Allow saved, but iptables apply failed: ' + (msg or '')[:200])});"
+            f"location.href={json.dumps(url_for('edit_device', mac=mac))}</script>")
     return redirect(url_for('edit_device', mac=mac))
 
 
@@ -696,10 +708,13 @@ def grant_allow(mac):
 def clear_allow(mac):
     mac = mac.strip().lower()
     dhc.MEMDB.set_allow_until(mac, None)
-    dhc.apply_mac_policy(mac, 'study', None)
+    _eff, ok, msg = dhc.apply_mac_policy(mac, 'study', None)
     dhc.MEMDB.flush_all()
+    if not ok:
+        return (
+            f"<script>alert({json.dumps('Cleared in DB, but iptables apply failed: ' + (msg or '')[:200])});"
+            f"location.href={json.dumps(url_for('edit_device', mac=mac))}</script>")
     return redirect(url_for('edit_device', mac=mac))
-
 
 @app.route('/delete/<mac>')
 @web_auth.login_required

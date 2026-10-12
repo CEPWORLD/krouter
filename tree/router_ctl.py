@@ -35,13 +35,38 @@ def _env() -> dict:
 
 
 def _run_router(args: list[str]) -> tuple[bool, str]:
-    cmd = ['sudo', '-E', _script(), *args]
+    """
+    Run router.sh with Settings NIC env.
+    Do NOT use `sudo -E` — on this host (sudo-rs) -E is ignored, so INB/OUT
+    never reach the script and every set/refresh fails with "INB/OUT unset".
+    Root: run directly with env=. Non-root: `sudo env INB=... OUT=... bash script`.
+    """
+    env = _env()
+    script = os.path.abspath(_script())
+    inb, out_if = env.get('INB', ''), env.get('OUT', '')
     if _dry():
-        note = f'DRY_RUN: would run: INB={_env().get("INB")} OUT={_env().get("OUT")} {" ".join(cmd)}'
+        note = f'DRY_RUN: would run: INB={inb} OUT={out_if} {script} {" ".join(args)}'
         log.info(note)
         return True, note
+    if not inb or not out_if:
+        msg = 'INB/OUT unset in settings — configure Internal/WAN device in Settings'
+        log.error(msg)
+        return False, msg
     try:
-        rt = subprocess.run(cmd, capture_output=True, text=True, env=_env())
+        if os.geteuid() == 0:
+            cmd = ['bash', script, *args]
+            rt = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        else:
+            cmd = [
+                'sudo', 'env',
+                f'INB={inb}',
+                f'OUT={out_if}',
+                f'SERVER_IP_DEFAULT={env.get("SERVER_IP_DEFAULT", "")}',
+                f'ROUTER_DNS_IP={env.get("ROUTER_DNS_IP", "")}',
+                f'KROUTER_DRY_RUN={env.get("KROUTER_DRY_RUN", os.environ.get("KROUTER_DRY_RUN", "0"))}',
+                'bash', script, *args,
+            ]
+            rt = subprocess.run(cmd, capture_output=True, text=True)
         out = (rt.stdout or '') + (rt.stderr or '')
         ok = rt.returncode == 0
         if ok:
