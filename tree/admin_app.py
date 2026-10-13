@@ -604,8 +604,9 @@ def devices():
 def leases():
     cols = ('mac', 'ip', 'hostname', 'mode', 'effective', 'last_seen')
     sort, direction = _parse_sort(cols, 'ip')
+    dhc.MEMDB.sync_reservations_from_disk()
     dhc.MEMDB.sync_leases_from_disk()
-    dhc.MEMDB.maybe_sync_reservations()
+    dhc.MEMDB.clear_expired_allows()
     with dhc.MEMDB.lock:
         rows = [dhc._enrich(r) for r in dhc.MEMDB.leases_by_mac.values()]
     rows = _sort_rows(rows, sort, direction, {
