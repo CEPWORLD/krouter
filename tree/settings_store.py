@@ -25,6 +25,9 @@ DEFAULTS: dict[str, Any] = {
     'admin_password_hash': '',  # web_auth 가 최초 설정
     'study_schedule_start': getattr(config, 'STUDY_SCHEDULE_START', '06:00'),
     'study_schedule_end': getattr(config, 'STUDY_SCHEDULE_END', '22:00'),
+    # default mode window (start==end → 24h DEFAULT, same as today)
+    'default_schedule_start': '00:00',
+    'default_schedule_end': '00:00',
     'new_device_mode': getattr(config, 'NEW_DEVICE_MODE', 'default'),
     'upstream_dns': getattr(config, 'upstream_dns', '8.8.8.8'),
     'dns_local_only': bool(getattr(config, 'dns_local_only', False)),
@@ -155,6 +158,8 @@ def policy_kwargs() -> dict:
     return {
         'study_start': s.get('study_schedule_start') or '06:00',
         'study_end': s.get('study_schedule_end') or '22:00',
+        'default_start': s.get('default_schedule_start') or '00:00',
+        'default_end': s.get('default_schedule_end') or '00:00',
     }
 
 

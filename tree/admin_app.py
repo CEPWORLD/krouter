@@ -421,10 +421,15 @@ TPL_SETTINGS = MENU + '''
 <hr>
 <h2>Settings</h2>
 <form method="post">
+  <h3>Default schedule (local)</h3>
+  Start <input name="default_schedule_start" value="{{ s.default_schedule_start }}">
+  End <input name="default_schedule_end" value="{{ s.default_schedule_end }}">
+  <small>Inside window → DEFAULT (light block). Outside → BLOCK.
+    If start==end, default window is 24h (no schedule cut).</small>
   <h3>Study schedule (local)</h3>
   Start <input name="study_schedule_start" value="{{ s.study_schedule_start }}">
   End <input name="study_schedule_end" value="{{ s.study_schedule_end }}">
-  <small>If start==end, study window is 24h</small>
+  <small>Inside window → STUDY. Outside → BLOCK. If start==end, study window is 24h</small>
   <h3>New device mode</h3>
   <select name="new_device_mode">
     <option value="default" {% if s.new_device_mode=='default' %}selected{% endif %}>default</option>
@@ -452,7 +457,7 @@ TPL_SETTINGS = MENU + '''
   <textarea name="default_block_domains" rows="3" cols="70">{{ default_domains }}</textarea>
   <h3>Study block domains</h3>
   <textarea name="study_block_domains" rows="3" cols="70">{{ study_domains }}</textarea>
-  <h3>BLOCK allow (outside study schedule) — proto:ip:port</h3>
+  <h3>BLOCK allow (outside default/study schedule) — proto:ip:port</h3>
   <p style="color:#555;font-size:13px">
     Extra allow while effective mode is BLOCK. One rule per line.<br>
     Format: <code>tcp|udp|any</code>:<code>IP[/CIDR]</code>:<code>port|*</code><br>
@@ -1090,6 +1095,8 @@ def settings_page():
         if arp_size not in settings_store.ARP_TABLE_CHOICES:
             return "<script>alert('invalid ARP table size');history.back();</script>"
         settings_store.set_many({
+            'default_schedule_start': request.form.get('default_schedule_start', '00:00').strip(),
+            'default_schedule_end': request.form.get('default_schedule_end', '00:00').strip(),
             'study_schedule_start': request.form.get('study_schedule_start', '00:00').strip(),
             'study_schedule_end': request.form.get('study_schedule_end', '00:00').strip(),
             'new_device_mode': request.form.get('new_device_mode', 'default').strip() or 'default',

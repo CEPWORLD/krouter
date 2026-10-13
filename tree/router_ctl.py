@@ -91,11 +91,9 @@ def apply_chain(mac: str, chain: str) -> tuple[bool, str]:
 
 
 def apply_effective(mac: str, mode: str, allow_until: Optional[int] = None,
-                    study_start: str = '06:00', study_end: str = '22:00',
-                    study_until: Optional[int] = None) -> tuple[str, bool, str]:
+                    study_until: Optional[int] = None, **kw) -> tuple[str, bool, str]:
     eff = policy.effective_mode(
-        mode, allow_until, study_start=study_start, study_end=study_end,
-        study_until=study_until)
+        mode, allow_until, study_until=study_until, **kw)
     ok, msg = apply_chain(mac, eff)
     return eff, ok, msg
 

@@ -87,9 +87,9 @@ def compute_allow_hm(hours: int, minutes: int, now: Optional[datetime] = None) -
     return int((now + timedelta(minutes=total_m)).timestamp())
 
 
-def in_study_schedule(now: Optional[datetime] = None,
-                      start: str = '06:00',
-                      end: str = '22:00') -> bool:
+def in_schedule(now: Optional[datetime] = None,
+                start: str = '06:00',
+                end: str = '22:00') -> bool:
     """로컬 시각이 [start, end) 이면 True. start==end 이면 24h 허용."""
     now = now or datetime.now()
     t = now.time().replace(second=0, microsecond=0)
@@ -101,6 +101,10 @@ def in_study_schedule(now: Optional[datetime] = None,
         return s <= t < e
     # 자정 넘어가는 허용 구간 (예: 22:00~06:00)
     return t >= s or t < e
+
+
+# back-compat name
+in_study_schedule = in_schedule
 
 
 def _ts_active(ts: Optional[int], now_ts: int) -> bool:
@@ -118,13 +122,15 @@ def effective_mode(mode: str,
                    study_start: str = '06:00',
                    study_end: str = '22:00',
                    gateway: str = '192.168.0.1',
-                   study_until: Optional[int] = None) -> str:
+                   study_until: Optional[int] = None,
+                   default_start: str = '00:00',
+                   default_end: str = '00:00') -> str:
     """
     반환: ALL_ALLOW | DEFAULT | STUDY | BLOCK
 
     allow_until 유효 → ALL_ALLOW (Free time) for study *and* default.
-    study: schedule / study_until → STUDY, else BLOCK.
-    default: no grant → DEFAULT.
+    study: in schedule or study_until → STUDY, else BLOCK.
+    default: in schedule → DEFAULT, else BLOCK (start==end → 24h DEFAULT).
     custom GW → ALL_ALLOW.
     """
     kind = normalize_mode(mode, gateway)
@@ -135,11 +141,13 @@ def effective_mode(mode: str,
     # Free time (YouTube/games) — temporary ALL_ALLOW, then back to base mode
     if _ts_active(allow_until, now_ts):
         return 'ALL_ALLOW'
-    if kind == 'default':
-        return 'DEFAULT'
-    # study
     now_dt = datetime.fromtimestamp(now_ts)
-    if in_study_schedule(now_dt, study_start, study_end) or _ts_active(study_until, now_ts):
+    if kind == 'default':
+        if in_schedule(now_dt, default_start, default_end):
+            return 'DEFAULT'
+        return 'BLOCK'
+    # study
+    if in_schedule(now_dt, study_start, study_end) or _ts_active(study_until, now_ts):
         return 'STUDY'
     return 'BLOCK'
 

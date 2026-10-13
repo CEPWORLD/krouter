@@ -75,9 +75,7 @@ def apply_mac_policy(mac: str, mode: str, allow_until=None, study_until=None):
     if study_until is None:
         study_until = row.get('study_until')
     return router_ctl.apply_effective(
-        mac, mode, allow_until,
-        study_start=kw['study_start'], study_end=kw['study_end'],
-        study_until=study_until)
+        mac, mode, allow_until, study_until=study_until, **kw)
 
 
 class MemDB:
@@ -807,6 +805,9 @@ TPL_SETTINGS = '''
 <hr>
 <h2>Settings</h2>
 <form method="post">
+  <h3>Default schedule (local)</h3>
+  Start <input name="default_schedule_start" value="{{ s.default_schedule_start }}">
+  End <input name="default_schedule_end" value="{{ s.default_schedule_end }}">
   <h3>Study schedule (local)</h3>
   Start <input name="study_schedule_start" value="{{ s.study_schedule_start }}">
   End <input name="study_schedule_end" value="{{ s.study_schedule_end }}">
@@ -889,8 +890,7 @@ def _enrich(row):
     kw = _sched()
     eff = policy.effective_mode(
         row.get('router') or mode, au,
-        study_start=kw['study_start'], study_end=kw['study_end'],
-        gateway=gw, study_until=su)
+        gateway=gw, study_until=su, **kw)
     return {
         **row, 'mode': mode, 'effective': eff,
         'allow_until_fmt': _fmt_ts(au),
@@ -1060,6 +1060,8 @@ def settings_page():
             if len(npw) < 4:
                 return "<script>alert('password too short (min 4)');history.back();</script>"
         settings_store.set_many({
+            'default_schedule_start': request.form.get('default_schedule_start', '00:00').strip(),
+            'default_schedule_end': request.form.get('default_schedule_end', '00:00').strip(),
             'study_schedule_start': request.form.get('study_schedule_start', '06:00').strip(),
             'study_schedule_end': request.form.get('study_schedule_end', '22:00').strip(),
             'new_device_mode': policy.normalize_mode(request.form.get('new_device_mode', 'default')),
