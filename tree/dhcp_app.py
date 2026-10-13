@@ -443,7 +443,21 @@ class MemDB:
                 db.commit()
         self._touch_trigger()
 
+    @staticmethod
+    def _ts_expired(ts, now: int) -> bool:
+        """True if grant timestamp is set and already past (one-shot instance gone)."""
+        if ts is None or ts == '':
+            return False
+        try:
+            return int(ts) <= now
+        except (TypeError, ValueError):
+            return True  # garbage → clear
+
     def clear_expired_allows(self):
+        """
+        Free time / Extend study are one-shot: when the instant ends, wipe the
+        column to NULL (do not leave a stale 'until' that looks like a schedule).
+        """
         now = int(time.time())
         changed = []
         with self.lock:
@@ -453,11 +467,13 @@ class MemDB:
                 r = self.res_by_mac.get(mac) or self.leases_by_mac.get(mac) or {}
                 au = r.get('allow_until')
                 su = r.get('study_until')
-            if au is not None and int(au) <= now:
+            if self._ts_expired(au, now):
                 self.set_allow_until(mac, None)
+                app_log.info(f"[GRANT-EXPIRE] {mac} clear allow_until (was {au})")
                 changed.append(mac)
-            if su is not None and int(su) <= now:
+            if self._ts_expired(su, now):
                 self.set_study_until(mac, None)
+                app_log.info(f"[GRANT-EXPIRE] {mac} clear study_until (was {su})")
                 if mac not in changed:
                     changed.append(mac)
         return changed
@@ -855,10 +871,21 @@ def _fmt_ts(ts):
 
 
 def _enrich(row):
+    """UI row: drop expired one-shot grants from display; persist clear if still set."""
     gw = settings_store.get('gateway') or config.GATEWAY
     mode = policy.normalize_mode(row.get('router'), gw)
     au = row.get('allow_until')
     su = row.get('study_until')
+    now = int(time.time())
+    mac = (row.get('mac') or '').strip().lower()
+    if mac and MemDB._ts_expired(au, now):
+        MEMDB.set_allow_until(mac, None)
+        au = None
+        row = {**row, 'allow_until': None}
+    if mac and MemDB._ts_expired(su, now):
+        MEMDB.set_study_until(mac, None)
+        su = None
+        row = {**row, 'study_until': None}
     kw = _sched()
     eff = policy.effective_mode(
         row.get('router') or mode, au,

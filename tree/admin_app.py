@@ -577,8 +577,10 @@ def about_page():
 def devices():
     cols = ('mac', 'hostname', 'ip', 'mode', 'effective', 'study_until', 'allow_until', 'desc')
     sort, direction = _parse_sort(cols, 'hostname')
-    # Peer DHCP may have updated leases; reservations are Admin-written (already in mem)
+    # Refresh from disk + wipe expired one-shot Free/Extend (do not leave stale until)
+    dhc.MEMDB.sync_reservations_from_disk()
     dhc.MEMDB.sync_leases_from_disk()
+    dhc.MEMDB.clear_expired_allows()
     with dhc.MEMDB.lock:
         reservations = [dhc._enrich(r) for r in dhc.MEMDB.res_by_mac.values()]
     reservations = _sort_rows(reservations, sort, direction, {
@@ -710,7 +712,9 @@ def edit_device(mac):
                 f"location.href={json.dumps(url_for('devices'))}</script>")
         return redirect(url_for('devices'))
 
+    dhc.MEMDB.sync_reservations_from_disk()
     dhc.MEMDB.sync_leases_from_disk()
+    dhc.MEMDB.clear_expired_allows()
     with dhc.MEMDB.lock:
         r = dhc.MEMDB.res_by_mac.get(mac) or dhc.MEMDB.leases_by_mac.get(mac)
         if not r:
