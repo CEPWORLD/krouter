@@ -665,7 +665,7 @@ def add_reservation():
     hostname = request.form['hostname'].strip()
     lease_time = int(request.form.get('lease_time') or config.DEFAULT_LEASE)
     raw = request.form.get('router', 'default').strip()
-    if raw in ('default', 'all_allow', 'study'):
+    if raw in ('default', 'all_allow', 'study', 'iot'):
         router = raw
     elif dhc.validate_ip(raw):
         router = raw
@@ -701,7 +701,7 @@ def edit_device(mac):
         hostname = request.form['hostname'].strip()
         lease_time = int(request.form.get('lease_time') or config.DEFAULT_LEASE)
         raw = request.form.get('router', 'default').strip()
-        if raw in ('default', 'all_allow', 'study'):
+        if raw in ('default', 'all_allow', 'study', 'iot'):
             router = raw
         elif dhc.validate_ip(raw):
             router = raw
