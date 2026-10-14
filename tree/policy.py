@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 
-MODES = ('default', 'all_allow', 'study')
-CHAINS = ('DEFAULT', 'ALL_ALLOW', 'STUDY', 'BLOCK')
+MODES = ('default', 'all_allow', 'study', 'iot')
+CHAINS = ('DEFAULT', 'ALL_ALLOW', 'STUDY', 'BLOCK', 'IOT')
 
 
 @dataclass
@@ -39,7 +39,7 @@ def _is_ipv4(value: str) -> bool:
 
 
 def normalize_mode(raw: Optional[str], gateway: str = '192.168.0.1') -> str:
-    """표시용 모드: default|all_allow|study|custom."""
+    """표시용 모드: default|all_allow|study|iot|custom."""
     if not raw:
         return 'default'
     v = str(raw).strip()
@@ -126,9 +126,10 @@ def effective_mode(mode: str,
                    default_start: str = '00:00',
                    default_end: str = '00:00') -> str:
     """
-    반환: ALL_ALLOW | DEFAULT | STUDY | BLOCK
+    반환: ALL_ALLOW | DEFAULT | STUDY | BLOCK | IOT
 
     allow_until 유효 → ALL_ALLOW (Free time) for study *and* default.
+    iot: always IOT (no schedule; IoT plugs/cams — open + light entertainment block).
     study: in schedule or study_until → STUDY, else BLOCK.
     default: in schedule → DEFAULT, else BLOCK (start==end → 24h DEFAULT).
     custom GW → ALL_ALLOW.
@@ -141,6 +142,8 @@ def effective_mode(mode: str,
     # Free time (YouTube/games) — temporary ALL_ALLOW, then back to base mode
     if _ts_active(allow_until, now_ts):
         return 'ALL_ALLOW'
+    if kind == 'iot':
+        return 'IOT'
     now_dt = datetime.fromtimestamp(now_ts)
     if kind == 'default':
         if in_schedule(now_dt, default_start, default_end):
@@ -157,11 +160,12 @@ compute_study_until = compute_allow_until
 
 
 def dns_policy_for_effective(effective: str) -> str:
-    """DNS 측 정책 라벨: none | default_block | study_block | block_all"""
+    """DNS 측 정책 라벨: none | default_block | study_block | iot_block | block_all"""
     return {
         'ALL_ALLOW': 'none',
         'DEFAULT': 'default_block',
         'STUDY': 'study_block',
+        'IOT': 'iot_block',
         'BLOCK': 'block_all',
     }.get(effective, 'none')
 

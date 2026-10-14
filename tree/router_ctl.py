@@ -81,7 +81,7 @@ def _run_router(args: list[str]) -> tuple[bool, str]:
 
 def apply_chain(mac: str, chain: str) -> tuple[bool, str]:
     """
-    chain: DEFAULT | ALL_ALLOW | STUDY | BLOCK
+    chain: DEFAULT | ALL_ALLOW | STUDY | BLOCK | IOT
     """
     mac = mac.strip().lower()
     chain = chain.upper()

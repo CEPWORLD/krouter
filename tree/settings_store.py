@@ -33,6 +33,7 @@ DEFAULTS: dict[str, Any] = {
     'dns_local_only': bool(getattr(config, 'dns_local_only', False)),
     'default_block_domains': list(getattr(config, 'default_block_domains', [])),
     'study_block_domains': list(getattr(config, 'block_domains', [])),
+    'iot_block_domains': list(getattr(config, 'iot_block_domains', [])),
     'block_all_subdomains': bool(getattr(config, 'block_all_subdomains', True)),
     'gateway': getattr(config, 'GATEWAY', '192.168.0.1'),
     'dns_servers': getattr(config, 'DNS_SERVERS', '192.168.0.1'),

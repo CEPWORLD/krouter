@@ -224,6 +224,7 @@ TPL_DEVICES = MENU + '''
     <option value="default">default (light block)</option>
     <option value="all_allow">all_allow (unrestricted)</option>
     <option value="study">study</option>
+    <option value="iot">iot (plugs/cams — open + light video block)</option>
   </select>
   Desc <input name="desc" size="40">
   <button type="submit">Add</button>
@@ -269,6 +270,7 @@ TPL_EDIT = MENU + '''
     <option value="default" {% if mode=='default' %}selected{% endif %}>default</option>
     <option value="all_allow" {% if mode=='all_allow' %}selected{% endif %}>all_allow</option>
     <option value="study" {% if mode=='study' %}selected{% endif %}>study</option>
+    <option value="iot" {% if mode=='iot' %}selected{% endif %}>iot</option>
     {% if mode=='custom' %}
     <option value="{{ reservation.router }}" selected>custom {{ reservation.router }}</option>
     {% endif %}
@@ -435,6 +437,7 @@ TPL_SETTINGS = MENU + '''
     <option value="default" {% if s.new_device_mode=='default' %}selected{% endif %}>default</option>
     <option value="all_allow" {% if s.new_device_mode=='all_allow' %}selected{% endif %}>all_allow</option>
     <option value="study" {% if s.new_device_mode=='study' %}selected{% endif %}>study</option>
+    <option value="iot" {% if s.new_device_mode=='iot' %}selected{% endif %}>iot</option>
   </select>
   <h3>DNS</h3>
   Upstream <input name="upstream_dns" value="{{ s.upstream_dns }}">
@@ -457,6 +460,12 @@ TPL_SETTINGS = MENU + '''
   <textarea name="default_block_domains" rows="3" cols="70">{{ default_domains }}</textarea>
   <h3>Study block domains</h3>
   <textarea name="study_block_domains" rows="3" cols="70">{{ study_domains }}</textarea>
+  <h3>IoT block domains</h3>
+  <p style="color:#555;font-size:13px;max-width:640px">
+    For <b>iot</b> devices (plugs, garage, printer, cams): mostly open outbound;
+    only these entertainment/risk names are blocked. Cloud IoT APIs stay allowed.
+  </p>
+  <textarea name="iot_block_domains" rows="3" cols="70">{{ iot_domains }}</textarea>
   <h3>BLOCK allow (outside default/study schedule) — proto:ip:port</h3>
   <p style="color:#555;font-size:13px">
     Extra allow while effective mode is BLOCK. One rule per line.<br>
@@ -1110,6 +1119,7 @@ def settings_page():
             'dhcp_auto_end': auto_e,
             'default_block_domains': domains(request.form.get('default_block_domains', '')),
             'study_block_domains': domains(request.form.get('study_block_domains', '')),
+            'iot_block_domains': domains(request.form.get('iot_block_domains', '')),
             'block_allow_rules': allow_rules,
             'arp_table_size': arp_size,
             'admin_user': new_user,
@@ -1133,6 +1143,7 @@ def settings_page():
         TPL_SETTINGS, s=s,
         default_domains=', '.join(s.get('default_block_domains') or []),
         study_domains=', '.join(s.get('study_block_domains') or []),
+        iot_domains=', '.join(s.get('iot_block_domains') or []),
         block_allow_text='\n'.join(s.get('block_allow_rules') or []),
         arp_choices=settings_store.ARP_TABLE_CHOICES,
         arp_live=arp_live,

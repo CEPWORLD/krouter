@@ -83,11 +83,11 @@ _new_chain() {
 
 define_policy_chains() {
   if [[ "$DRY_RUN" == "1" ]]; then
-    msg "DRY define chains DEFAULT ALL_ALLOW STUDY BLOCK"
+    msg "DRY define chains DEFAULT ALL_ALLOW STUDY BLOCK IOT"
     return 0
   fi
   modprobe xt_string 2>/dev/null || true
-  for c in DEFAULT ALL_ALLOW STUDY BLOCK; do
+  for c in DEFAULT ALL_ALLOW STUDY BLOCK IOT; do
     _new_chain "$c"
   done
 
@@ -125,6 +125,18 @@ define_policy_chains() {
   iptables -A STUDY -p udp --sport 68 --dport 67 -j ACCEPT
   iptables -A STUDY -p udp --sport 67 --dport 68 -j ACCEPT
   iptables -A STUDY -j RETURN
+
+  # ---- IOT (가전/플러그: 기본 열림 + entertainment 문자열만 가볍게) ----
+  # 클라우드 IoT·캠용 HTTPS/UDP는 열어 둠. STUDY식 UDP 전면차단 없음.
+  for d in youtube.com youtu.be googlevideo.com ytimg.com gvt1.com netflix.com nflxvideo.net roblox.com; do
+    iptables -A IOT -p tcp --dport 443 -m string --string "$d" --algo bm -j REJECT
+    iptables -A IOT -p tcp --dport 80  -m string --string "$d" --algo bm -j REJECT
+  done
+  # 흔한 스팸/스캔성 아웃바운드만 (IoT가 보통 안 씀)
+  iptables -A IOT -p tcp --dport 25 -j REJECT
+  iptables -A IOT -p tcp --dport 465 -j REJECT
+  iptables -A IOT -p tcp --dport 587 -j REJECT
+  iptables -A IOT -j RETURN
 
   # BLOCK 본문은 refresh_block 에서 채움 (허용 IP/포트 파일 반영)
   refresh_block
@@ -254,7 +266,7 @@ refresh_block() {
 }
 
 is_mac() { [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; }
-is_chain() { [[ "$1" =~ ^(DEFAULT|ALL_ALLOW|STUDY|BLOCK)$ ]]; }
+is_chain() { [[ "$1" =~ ^(DEFAULT|ALL_ALLOW|STUDY|BLOCK|IOT)$ ]]; }
 
 _clear_mac_jumps() {
   local mac="$1"
@@ -263,7 +275,7 @@ _clear_mac_jumps() {
     return 0
   fi
   local c
-  for c in DEFAULT ALL_ALLOW STUDY BLOCK STUDY; do
+  for c in DEFAULT ALL_ALLOW STUDY BLOCK IOT; do
     while iptables -C FORWARD -i "${INB}" -o "${OUT}" -m mac --mac-source "${mac}" -j "$c" 2>/dev/null; do
       ipt -D FORWARD -i "${INB}" -o "${OUT}" -m mac --mac-source "${mac}" -j "$c" || true
     done
@@ -273,7 +285,7 @@ _clear_mac_jumps() {
 set_mac_chain() {
   local mac="$1" chain="$2"
   is_mac "$mac" || err "MAC 형식 아님: $mac"
-  is_chain "$chain" || err "체인 아님: $chain (DEFAULT|ALL_ALLOW|STUDY|BLOCK)"
+  is_chain "$chain" || err "체인 아님: $chain (DEFAULT|ALL_ALLOW|STUDY|BLOCK|IOT)"
   _clear_mac_jumps "$mac"
   # IN↔IN 다음, 일반 FORWARD 앞
   ipt -I FORWARD 2 -i "${INB}" -o "${OUT}" -m mac --mac-source "$mac" -j "$chain"
@@ -410,7 +422,7 @@ usage() {
 Usage:
   KROUTER_DRY_RUN=1 $0 init|set|add|del|list|...
   sudo $0 init
-  sudo $0 set MAC DEFAULT|ALL_ALLOW|STUDY|BLOCK
+  sudo $0 set MAC DEFAULT|ALL_ALLOW|STUDY|BLOCK|IOT
   sudo $0 add MAC          # STUDY (호환)
   sudo $0 del MAC          # DEFAULT (호환)
   sudo $0 list

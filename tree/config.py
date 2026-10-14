@@ -29,7 +29,7 @@ def _read_version() -> str:
                     return v
         except Exception:
             pass
-    return os.environ.get('KROUTER_VERSION', '6.4.139')
+    return os.environ.get('KROUTER_VERSION', '6.4.140')
 
 
 VERSION = _read_version()
@@ -88,6 +88,11 @@ block_domains = [
     'youtube.com', 'youtu.be', 'googlevideo.com', 'ytimg.com', 'gvt1.com',
     'roblox.com', 'scratch.mit.edu', 'scdn.co', 'comicfury.com',
 ]
+# iot 모드 — 가전/플러그용: entertainment만 가볍게 (클라우드 IoT는 열어 둠)
+iot_block_domains = [
+    'youtube.com', 'youtu.be', 'googlevideo.com', 'ytimg.com', 'gvt1.com',
+    'netflix.com', 'nflxvideo.net', 'roblox.com',
+]
 block_all_subdomains = True
 
 # =========================
@@ -111,7 +116,7 @@ IP_TEMP_START = ipaddress.IPv4Address('192.168.0.100')
 IP_TEMP_END = ipaddress.IPv4Address('192.168.0.200')
 
 # 신규 MAC 기본 모드
-NEW_DEVICE_MODE = 'default'  # default | all_allow | study
+NEW_DEVICE_MODE = 'default'  # default | all_allow | study | iot
 
 # study 정규 허용 시간 (로컬 TZ, HH:MM). 이 밖이면 BLOCK (임시해금 없을 때)
 STUDY_SCHEDULE_START = '06:00'

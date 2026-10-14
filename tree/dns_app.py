@@ -232,6 +232,8 @@ class MemDB:
         q = self.normalize(qname)
         if dns_pol == 'default_block':
             return _match_domain(q, s.get('default_block_domains') or [], all_sub)
+        if dns_pol == 'iot_block':
+            return _match_domain(q, s.get('iot_block_domains') or [], all_sub)
         if dns_pol == 'study_block':
             if _match_domain(q, s.get('study_block_domains') or [], all_sub):
                 return True

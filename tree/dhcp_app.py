@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# dhcp_app.py — DHCP service + MemDB + policy hooks (default / all_allow / study).
+# dhcp_app.py — DHCP service + MemDB + policy hooks (default / all_allow / study / iot).
 #
 # Author : Kage
 # Project: krouter
@@ -731,6 +731,7 @@ TPL_MAIN = '''
     <option value="default">default (약차단)</option>
     <option value="all_allow">all_allow (무제한)</option>
     <option value="study">study</option>
+    <option value="iot">iot (plugs/cams)</option>
   </select>
   Desc <input name="desc" size="40">
   <button type="submit">Add</button>
@@ -766,6 +767,7 @@ TPL_EDIT = '''
     <option value="default" {% if mode=='default' %}selected{% endif %}>default</option>
     <option value="all_allow" {% if mode=='all_allow' %}selected{% endif %}>all_allow</option>
     <option value="study" {% if mode=='study' %}selected{% endif %}>study</option>
+    <option value="iot" {% if mode=='iot' %}selected{% endif %}>iot</option>
   </select><br>
   Desc <input name="desc" value="{{ reservation.desc or '' }}" size="60"><br>
   <button type="submit">Update</button>
@@ -816,6 +818,7 @@ TPL_SETTINGS = '''
     <option value="default" {% if s.new_device_mode=='default' %}selected{% endif %}>default</option>
     <option value="all_allow" {% if s.new_device_mode=='all_allow' %}selected{% endif %}>all_allow</option>
     <option value="study" {% if s.new_device_mode=='study' %}selected{% endif %}>study</option>
+    <option value="iot" {% if s.new_device_mode=='iot' %}selected{% endif %}>iot</option>
   </select>
   <h3>DNS</h3>
   Upstream <input name="upstream_dns" value="{{ s.upstream_dns }}">
@@ -827,6 +830,8 @@ TPL_SETTINGS = '''
   <textarea name="default_block_domains" rows="3" cols="60">{{ default_domains }}</textarea>
   <h3>Study block domains (comma)</h3>
   <textarea name="study_block_domains" rows="3" cols="60">{{ study_domains }}</textarea>
+  <h3>IoT block domains (comma)</h3>
+  <textarea name="iot_block_domains" rows="3" cols="60">{{ iot_domains }}</textarea>
   <h3>Login account</h3>
   Current user: <b>{{ s.admin_user }}</b><br>
   New username <input name="admin_user" value="{{ s.admin_user }}" required><br>
@@ -1071,6 +1076,7 @@ def settings_page():
             'dns_servers': request.form.get('dns_servers', config.DNS_SERVERS).strip(),
             'default_block_domains': domains(request.form.get('default_block_domains', '')),
             'study_block_domains': domains(request.form.get('study_block_domains', '')),
+            'iot_block_domains': domains(request.form.get('iot_block_domains', '')),
             'admin_user': new_user,
         })
         if npw:
@@ -1080,7 +1086,8 @@ def settings_page():
     return render_template_string(
         TPL_SETTINGS, s=s, safe=config.SAFE_MODE,
         default_domains=', '.join(s.get('default_block_domains') or []),
-        study_domains=', '.join(s.get('study_block_domains') or []))
+        study_domains=', '.join(s.get('study_block_domains') or []),
+        iot_domains=', '.join(s.get('iot_block_domains') or []))
 
 
 @app.route('/dhcp_leases')
