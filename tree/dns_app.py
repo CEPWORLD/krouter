@@ -389,6 +389,7 @@ class DNSServer:
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
         # Cap in-flight work so a flood cannot grow an unbounded queue.
         self._inflight = threading.Semaphore(DNS_MAX_INFLIGHT)
+        self._last_drop_log = 0.0
 
     def forward_request(self, data):
         upstream = (settings_store.get('upstream_dns') or config.upstream_dns, 53)
@@ -434,7 +435,11 @@ class DNSServer:
             return
         # rare log — only when recv-loop drops (saturation)
         if why == 'saturated':
-            app_log.info(f"[DROP] {addr[0]} DNS saturated (inflight>={DNS_MAX_INFLIGHT})")
+            now = time.time()
+            if now - self._last_drop_log >= 30.0:
+                self._last_drop_log = now
+                app_log.info(
+                    f"[DROP] {addr[0]} DNS saturated (inflight>={DNS_MAX_INFLIGHT})")
 
     def handle_query(self, data, addr):
         try:
