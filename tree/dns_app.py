@@ -26,10 +26,12 @@ import settings_store
 import web_auth
 
 # Upstream / flood protection — one noisy client must not stall house DNS.
+# Tuned soft: Chromebooks/GoGuardian easily exceed 80 q/15s; only count
+# upstream forwards (not BLOCK/local), and quarantine mainly on FAIL storms.
 UPSTREAM_TIMEOUT_SEC = float(getattr(config, 'dns_upstream_timeout', 1.0))
 THROTTLE_WINDOW_SEC = 15.0
-THROTTLE_FAIL_LIMIT = 20          # FAILs in window → quarantine
-THROTTLE_QUERY_LIMIT = 80         # queries in window → quarantine
+THROTTLE_FAIL_LIMIT = 40          # upstream FAILs in window → quarantine
+THROTTLE_QUERY_LIMIT = 400        # upstream queries in window → quarantine (extreme)
 QUARANTINE_SEC = 300              # 5 minutes
 DNS_MAX_INFLIGHT = 40             # recv fail-fast when saturated
 
@@ -146,8 +148,8 @@ class ClientThrottle:
             f"q>={THROTTLE_QUERY_LIMIT})")
         return True
 
-    def note_query(self, ip: str) -> bool:
-        """Record a query. Returns True if client is (now) quarantined."""
+    def note_upstream(self, ip: str) -> bool:
+        """Count a real upstream forward only (not BLOCK/local). Returns quarantined?"""
         now = time.time()
         with self._lock:
             until = self._until.get(ip)
@@ -157,7 +159,7 @@ class ClientThrottle:
             dq.append(now)
             self._prune(dq, now)
             if len(dq) >= THROTTLE_QUERY_LIMIT:
-                self._enter(ip, f'query_flood n={len(dq)}', now)
+                self._enter(ip, f'upstream_flood n={len(dq)}', now)
                 return True
         return False
 
@@ -455,7 +457,7 @@ class DNSServer:
             with MEMDB.lock:
                 MEMDB.query_count += 1
 
-            quarantined = THROTTLE.note_query(client_ip) or THROTTLE.is_quarantined(client_ip)
+            quarantined = THROTTLE.is_quarantined(client_ip)
 
             def _quiet_nx(tag=''):
                 if THROTTLE.should_log_quiet(client_ip):
@@ -464,17 +466,24 @@ class DNSServer:
                         f"quarantine {THROTTLE.remaining_sec(client_ip)}s left{tag}")
                 self.sock.sendto(self._reply_nx(req).pack(), addr)
 
-            if MEMDB.get_bypass():
-                if quarantined:
-                    _quiet_nx(' (bypass)')
+            def _forward():
+                # Count only real upstream work (BLOCK/local must not trip kids' PCs).
+                if THROTTLE.note_upstream(client_ip):
+                    _quiet_nx()
                     return
                 fwd, err = self.forward_request(data)
                 if fwd:
                     self.sock.sendto(fwd, addr)
-                else:
-                    THROTTLE.note_fail(client_ip)
-                    self._log_deny('FAIL', client_ip, qnorm, qtype,
-                                   f"upstream err={err!r} (bypass)")
+                    return
+                THROTTLE.note_fail(client_ip)
+                self._log_deny('FAIL', client_ip, qnorm, qtype, f"upstream err={err!r}")
+                self.sock.sendto(self._reply_nx(req).pack(), addr)
+
+            if MEMDB.get_bypass():
+                if quarantined:
+                    _quiet_nx(' (bypass)')
+                    return
+                _forward()
                 return
             blocked = MEMDB.is_blocked_for_client(qnorm, client_ip)
             fake = getattr(config, 'fake_ip', '0.0.0.0')
@@ -495,16 +504,9 @@ class DNSServer:
                     self.sock.sendto(self._reply_nx(req).pack(), addr)
                     return
                 if quarantined:
-                    # No upstream — free workers for everyone else.
                     _quiet_nx()
                     return
-                fwd, err = self.forward_request(data)
-                if fwd:
-                    self.sock.sendto(fwd, addr)
-                    return
-                THROTTLE.note_fail(client_ip)
-                self._log_deny('FAIL', client_ip, qnorm, qtype, f"upstream err={err!r}")
-                self.sock.sendto(self._reply_nx(req).pack(), addr)
+                _forward()
                 return
             if blocked:
                 with MEMDB.lock:
@@ -515,13 +517,7 @@ class DNSServer:
             if quarantined:
                 _quiet_nx()
                 return
-            fwd, err = self.forward_request(data)
-            if fwd:
-                self.sock.sendto(fwd, addr)
-            else:
-                THROTTLE.note_fail(client_ip)
-                self._log_deny('FAIL', client_ip, qnorm, qtype, f"upstream err={err!r}")
-                self.sock.sendto(self._reply_nx(req).pack(), addr)
+            _forward()
         except Exception as e:
             app_log.error(f"DNS handle error: {e}")
 
