@@ -29,7 +29,7 @@ def _read_version() -> str:
                     return v
         except Exception:
             pass
-    return os.environ.get('KROUTER_VERSION', '6.4.141')
+    return os.environ.get('KROUTER_VERSION', '6.4.142')
 
 
 VERSION = _read_version()
@@ -75,6 +75,8 @@ settings_db_file = os.path.join(KROUTER_ROOT, 'data', 'settings.db')
 # =========================
 dns_local_only = False
 upstream_dns = '8.8.8.8'
+# DNS forward timeout (sec). Short so one slow upstream cannot fill all workers.
+dns_upstream_timeout = 1.0
 STUDY_TOKEN = 'study'
 fake_ip = '0.0.0.0'
 

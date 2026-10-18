@@ -13,6 +13,7 @@ import threading
 import sqlite3
 import socket
 import logging
+from collections import defaultdict, deque
 from logging.handlers import RotatingFileHandler
 from dnslib import DNSRecord, RR, QTYPE, A, RCODE
 from flask import Flask, request, redirect, render_template_string, url_for, jsonify
@@ -23,6 +24,14 @@ import common
 import policy
 import settings_store
 import web_auth
+
+# Upstream / flood protection — one noisy client must not stall house DNS.
+UPSTREAM_TIMEOUT_SEC = float(getattr(config, 'dns_upstream_timeout', 1.0))
+THROTTLE_WINDOW_SEC = 15.0
+THROTTLE_FAIL_LIMIT = 20          # FAILs in window → quarantine
+THROTTLE_QUERY_LIMIT = 80         # queries in window → quarantine
+QUARANTINE_SEC = 300              # 5 minutes
+DNS_MAX_INFLIGHT = 40             # recv fail-fast when saturated
 
 os.makedirs(os.path.join(config.KROUTER_ROOT, 'logs'), exist_ok=True)
 os.makedirs(os.path.join(config.KROUTER_ROOT, 'data'), exist_ok=True)
@@ -71,6 +80,104 @@ def _match_domain(qname: str, domains, all_sub: bool) -> bool:
         if not all_sub and q == d:
             return True
     return False
+
+
+class ClientThrottle:
+    """
+    Per-client flood guard. A laptop dumping ads/trackers (or WAN blip + retries)
+    used to fill all DNS workers with 5s upstream waits and make Deco APs go red.
+    Quarantine that IP only for QUARANTINE_SEC — rest of the house stays up.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._fails: dict[str, deque] = defaultdict(deque)
+        self._queries: dict[str, deque] = defaultdict(deque)
+        self._until: dict[str, float] = {}
+        self._last_log: dict[str, float] = {}
+
+    def _prune(self, dq: deque, now: float) -> None:
+        cut = now - THROTTLE_WINDOW_SEC
+        while dq and dq[0] < cut:
+            dq.popleft()
+
+    def is_quarantined(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            until = self._until.get(ip)
+            if until is None:
+                return False
+            if now < until:
+                return True
+            self._until.pop(ip, None)
+            self._fails.pop(ip, None)
+            self._queries.pop(ip, None)
+            return False
+
+    def remaining_sec(self, ip: str) -> int:
+        with self._lock:
+            until = self._until.get(ip)
+        if not until:
+            return 0
+        return max(0, int(until - time.time()))
+
+    def should_log_quiet(self, ip: str, every_sec: float = 30.0) -> bool:
+        """True at most once per every_sec while quarantined (avoid QUIET spam)."""
+        now = time.time()
+        with self._lock:
+            last = self._last_log.get(ip, 0.0)
+            if now - last < every_sec:
+                return False
+            self._last_log[ip] = now
+            return True
+
+    def _enter(self, ip: str, reason: str, now: float) -> bool:
+        """Return True if newly quarantined (for one-shot log)."""
+        prev = self._until.get(ip)
+        if prev and prev > now:
+            return False
+        self._until[ip] = now + QUARANTINE_SEC
+        self._fails[ip].clear()
+        self._queries[ip].clear()
+        self._last_log[ip] = now
+        app_log.info(
+            f"[QUARANTINE] {ip} {reason} — mute upstream {QUARANTINE_SEC}s "
+            f"(window={THROTTLE_WINDOW_SEC}s fail>={THROTTLE_FAIL_LIMIT} "
+            f"q>={THROTTLE_QUERY_LIMIT})")
+        return True
+
+    def note_query(self, ip: str) -> bool:
+        """Record a query. Returns True if client is (now) quarantined."""
+        now = time.time()
+        with self._lock:
+            until = self._until.get(ip)
+            if until and now < until:
+                return True
+            dq = self._queries[ip]
+            dq.append(now)
+            self._prune(dq, now)
+            if len(dq) >= THROTTLE_QUERY_LIMIT:
+                self._enter(ip, f'query_flood n={len(dq)}', now)
+                return True
+        return False
+
+    def note_fail(self, ip: str) -> bool:
+        """Record upstream FAIL. Returns True if client is (now) quarantined."""
+        now = time.time()
+        with self._lock:
+            until = self._until.get(ip)
+            if until and now < until:
+                return True
+            dq = self._fails[ip]
+            dq.append(now)
+            self._prune(dq, now)
+            if len(dq) >= THROTTLE_FAIL_LIMIT:
+                self._enter(ip, f'upstream_fail n={len(dq)}', now)
+                return True
+        return False
+
+
+THROTTLE = ClientThrottle()
 
 
 class MemDB:
@@ -280,11 +387,13 @@ class DNSServer:
         self.sock.settimeout(5.0)
         self.sock.bind((self.host, self.port))
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        # Cap in-flight work so a flood cannot grow an unbounded queue.
+        self._inflight = threading.Semaphore(DNS_MAX_INFLIGHT)
 
     def forward_request(self, data):
         upstream = (settings_store.get('upstream_dns') or config.upstream_dns, 53)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(5)
+        s.settimeout(UPSTREAM_TIMEOUT_SEC)
         try:
             s.sendto(data, upstream)
             resp, _ = s.recvfrom(4096)
@@ -303,6 +412,11 @@ class DNSServer:
         reply.header.rcode = RCODE.NOERROR
         return reply
 
+    def _reply_nx(self, req):
+        reply = req.reply()
+        reply.header.rcode = RCODE.NXDOMAIN
+        return reply
+
     def _log_deny(self, kind: str, client_ip: str, qnorm: str, qtype, extra: str = ''):
         who = MEMDB.client_label(client_ip)
         eff = MEMDB.client_effective(client_ip)
@@ -310,6 +424,17 @@ class DNSServer:
         if extra:
             msg += f" {extra}"
         app_log.info(msg)
+
+    def _send_nx_raw(self, data, addr, why: str):
+        """Best-effort NXDOMAIN without occupying an upstream slot."""
+        try:
+            req = DNSRecord.parse(data)
+            self.sock.sendto(self._reply_nx(req).pack(), addr)
+        except Exception:
+            return
+        # rare log — only when recv-loop drops (saturation)
+        if why == 'saturated':
+            app_log.info(f"[DROP] {addr[0]} DNS saturated (inflight>={DNS_MAX_INFLIGHT})")
 
     def handle_query(self, data, addr):
         try:
@@ -324,11 +449,25 @@ class DNSServer:
                 qtype = str(req.q.qtype)
             with MEMDB.lock:
                 MEMDB.query_count += 1
+
+            quarantined = THROTTLE.note_query(client_ip) or THROTTLE.is_quarantined(client_ip)
+
+            def _quiet_nx(tag=''):
+                if THROTTLE.should_log_quiet(client_ip):
+                    self._log_deny(
+                        'QUIET', client_ip, qnorm, qtype,
+                        f"quarantine {THROTTLE.remaining_sec(client_ip)}s left{tag}")
+                self.sock.sendto(self._reply_nx(req).pack(), addr)
+
             if MEMDB.get_bypass():
+                if quarantined:
+                    _quiet_nx(' (bypass)')
+                    return
                 fwd, err = self.forward_request(data)
                 if fwd:
                     self.sock.sendto(fwd, addr)
                 else:
+                    THROTTLE.note_fail(client_ip)
                     self._log_deny('FAIL', client_ip, qnorm, qtype,
                                    f"upstream err={err!r} (bypass)")
                 return
@@ -348,40 +487,54 @@ class DNSServer:
                     return
                 if local_only:
                     self._log_deny('DENY', client_ip, qnorm, qtype, 'local_only NXDOMAIN')
-                    reply = req.reply()
-                    reply.header.rcode = RCODE.NXDOMAIN
-                    self.sock.sendto(reply.pack(), addr)
+                    self.sock.sendto(self._reply_nx(req).pack(), addr)
+                    return
+                if quarantined:
+                    # No upstream — free workers for everyone else.
+                    _quiet_nx()
                     return
                 fwd, err = self.forward_request(data)
                 if fwd:
                     self.sock.sendto(fwd, addr)
                     return
+                THROTTLE.note_fail(client_ip)
                 self._log_deny('FAIL', client_ip, qnorm, qtype, f"upstream err={err!r}")
-                reply = req.reply()
-                reply.header.rcode = RCODE.NXDOMAIN
-                self.sock.sendto(reply.pack(), addr)
+                self.sock.sendto(self._reply_nx(req).pack(), addr)
                 return
             if blocked:
                 with MEMDB.lock:
                     MEMDB.blocked_count += 1
                 self._log_deny('BLOCK', client_ip, qnorm, qtype, 'NXDOMAIN')
-                reply = req.reply()
-                reply.header.rcode = RCODE.NXDOMAIN
-                self.sock.sendto(reply.pack(), addr)
+                self.sock.sendto(self._reply_nx(req).pack(), addr)
+                return
+            if quarantined:
+                _quiet_nx()
                 return
             fwd, err = self.forward_request(data)
             if fwd:
                 self.sock.sendto(fwd, addr)
             else:
+                THROTTLE.note_fail(client_ip)
                 self._log_deny('FAIL', client_ip, qnorm, qtype, f"upstream err={err!r}")
+                self.sock.sendto(self._reply_nx(req).pack(), addr)
         except Exception as e:
             app_log.error(f"DNS handle error: {e}")
+
+    def _run_query(self, data, addr):
+        try:
+            self.handle_query(data, addr)
+        finally:
+            self._inflight.release()
 
     def serve_forever(self):
         while True:
             try:
                 data, addr = self.sock.recvfrom(2048)
-                self.executor.submit(self.handle_query, data, addr)
+                if not self._inflight.acquire(blocking=False):
+                    # House stays up: drop overflow with fast NX, do not queue forever.
+                    self._send_nx_raw(data, addr, 'saturated')
+                    continue
+                self.executor.submit(self._run_query, data, addr)
             except socket.timeout:
                 continue
             except Exception as e:
